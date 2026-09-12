@@ -9,6 +9,7 @@ dist/
 .pytest_cache/
 .ruff_cache/
 config.ini
+AGENTS.md
 anime_jp_sub.log
 .last_run.json
 .tmp_*/

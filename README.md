@@ -175,19 +175,49 @@ run_jp_sub.bat --keep-srt                 :: 保留中间字幕文件（排查�
 - 想确认字体内附成功：用 MKVToolNix 或 PotPlayer 看附件，能看到 `MPLUS1Code-VF.ttf`。
 - 处理完的目录里不该残留 `.jp.mkv` / `.jpc.mkv` / `.tmp_*` 这些东西。
 
-### 想调字号 / 位置 / 每行字数
+### 想调字号 / 位置 / 换程序路径：`config.ini`
 
-复制 `config.example.ini` 成 `config.ini`，放在**项目根目录**（和 `run_jp_sub.py` 同一层），
-然后改 `[furigana]`：
+**所有能调的东西都写在一个文件里**：复制 `config.example.ini` 成 `config.ini`，放在
+**项目根目录**（和 `run_jp_sub.py` 同一层）。想只影响某一部番，就把这份 `config.ini`
+放进那个番剧文件夹里（番剧级设置优先于全局）。
 
 ```ini
+[paths]
+; 装在 PATH 里的程序不用写；下面是"装在别处 / 想固定版本"时才需要
+ffmpeg      = D:\ffmpeg\bin\ffmpeg.exe
+ffprobe     = D:\ffmpeg\bin\ffprobe.exe
+mkvmerge    = D:\MKVToolNix\mkvmerge.exe
+mkvpropedit = D:\MKVToolNix\mkvpropedit.exe
+
+; whisper 模型放哪。填"上一级目录"：它下面要有 large-v3 子目录，那 5 个文件在子目录里
+model_dir   = D:\models
+
+; 自动下载的 ffmpeg / MKVToolNix 放哪儿（默认：项目目录下的 tools\）
+tools_dir   = D:\anime-jp-sub-tools
+
+; 日志写哪儿（默认：写在你处理的那个文件夹里，文件名 anime_jp_sub.log）
+log_dir     = D:\logs
+
 [furigana]
-main_px   = 60     ; 主字幕字号（1080p 基准，实际按画面高度比例换算）
+main_px   = 60     ; 主字幕字号（1080p 基准；实际按画面高度等比换算，换分辨率不会跑偏）
 bottom_px = 50     ; 字幕距底边多少像素
 max_chars = 30     ; 每行最多几个字，超过就拆成前后相继的两条
 ```
 
-把这份 `config.ini` 放进**某个番剧文件夹**里，就只影响那一部（番剧级的设置优先于全局）。
+程序找外部程序的顺序是 **环境变量 → `config.ini` → 系统 PATH → 项目 `tools\`**（先命中先用，
+系统里已经装好的永远优先）。对应的环境变量（优先级比配置文件更高）：
+
+| 环境变量 | 作用 |
+|---|---|
+| `ANIME_JP_SUB_FFMPEG` / `_FFPROBE` / `_MKVMERGE` / `_MKVPROPEDIT` | 指定某个外部程序 |
+| `ANIME_JP_SUB_MODEL_DIR` | 指定模型所在的那一层目录 |
+| `ANIME_JP_SUB_TOOLS_DIR` | 自动下载的外部程序放哪儿 |
+| `ANIME_JP_SUB_LOG_DIR` / `ANIME_JP_SUB_NO_LOG=1` | 换日志位置 / 干脆不写日志 |
+| `ANIME_JP_SUB_FONT` | 换注音用的字体文件 |
+| `ANIME_JP_SUB_CONFIG` | 指定另一份 `config.ini` |
+| `ANIME_JP_SUB_HOME` / `ANIME_JP_SUB_PYTHON` | 告诉 `.bat` 项目在哪 / 用哪个 python.exe |
+
+> 配了却不生效？多半是放错位置了——全局的 `config.ini` 要放**项目根目录**，不是 `src\` 里面。
 
 ---
 
@@ -326,4 +356,3 @@ qBittorrent 正在做种、占着文件句柄。暂停那个任务（或退出 q
 - 随项目分发的字体：**M PLUS 1 Code**（SIL Open Font License 1.1，可自由再分发）
 - 外部程序（FFmpeg、MKVToolNix）与 whisper 模型**不随仓库分发**，由你自行安装/下载，
   各自的许可见 `THIRD_PARTY_NOTICES.md`
-
