@@ -1,0 +1,13 @@
+# Python dependencies for anime-jp-sub (versions verified on the author's machine).
+#
+# Install:  .venv\Scripts\python.exe -m pip install -r requirements.txt
+# Note: two **external programs** are not pip packages: ffmpeg and MKVToolNix.
+#       Put them in PATH and they are found automatically; or open --download-tools
+#       once to fetch them into the project's tools\ folder (see README).
+#
+# ASCII-only on purpose: pip decodes this file with the system locale encoding,
+# which is GBK on a Chinese Windows -> non-ASCII comments make pip crash with
+# UnicodeDecodeError before it installs anything.
+faster-whisper==1.2.1     # transcription engine (pulls ctranslate2 / av / tokenizers / onnxruntime)
+Janome==0.5.0             # morphological analysis, kanji readings
+pillow==12.3.0            # measure real glyph widths, render self-check
