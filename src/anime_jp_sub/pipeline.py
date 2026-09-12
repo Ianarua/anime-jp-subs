@@ -215,11 +215,13 @@ def _model_help(reason):
         f"     whisper large-v3 模型要**自己下**（约 3GB，本工具不自动下），放进这个目录：\n"
         f"       {model_path()}\n"
         f"     需要这 5 个文件：{'、'.join(MODEL_FILES)} 和 vocabulary.json\n"
-        f"     下载地址形如（国内连不上 huggingface.co 就用 hf-mirror.com）：\n"
-        f"       https://hf-mirror.com/{MODEL_REPO}/resolve/main/<文件名>\n"
+        f"     下载地址：\n"
+        f"       原站：https://huggingface.co/{MODEL_REPO}/tree/main\n"
+        f"       国内镜像：https://hf-mirror.com/{MODEL_REPO}/tree/main\n"
         f"     注意：仓库要用 CTranslate2 格式的 {MODEL_REPO}；\n"
         f"       {MODEL_REPO_BAD} 是 Transformers 格式，里面没有 model.bin，faster-whisper 用不了。\n"
-        f"     3GB 建议用能续传的工具下，例如：aria2c -c -x16 -s16 -k2M <链接>\n"
+        f"     3GB 建议用能续传的工具下，例如：aria2c -c -x16 -s16 -k2M <链接>"
+        f"（在页面里点文件名就能拿到链接）\n"
         f"     想放到别处：config.ini 的 [paths] model_dir = 别的路径（见 README「模型文件」）"
     )
 
