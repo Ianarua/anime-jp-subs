@@ -287,11 +287,62 @@ class TestDoctor(unittest.TestCase):
 
     def test_doctor_does_not_crash(self):
         buf = io.StringIO()
-        with mock.patch.object(common.sys, "stdout", buf):
+        # stdin 打成"非交互"，否则在缺 mkvmerge 的机器上跑测试会卡在 y/N 提问上
+        with mock.patch.object(common.sys, "stdout", buf), \
+             mock.patch.object(common.sys, "stdin", FakeStdin(False)):
             rc = common.doctor()
         self.assertIn(rc, (0, 1))
         self.assertIn("环境检查", buf.getvalue())
         self.assertIn("自动下载目录", buf.getvalue())
+
+
+class TestDoctorAsksToDownload(unittest.TestCase):
+    """`setup.bat` 结尾跑的就是 doctor：缺外部程序时要**主动问一句** [y/N]（用户要求
+    "在 setup 的时候就开始提示下载"）。非交互时仍然只报告，绝不偷偷下。"""
+
+    _MISSING = ["mkvmerge", "mkvpropedit"]
+
+    def test_interactive_asks(self):
+        calls = []
+
+        def fake_ensure(*a, **kw):
+            # 记下"是不是被要求直接下"：False = 走"问一句"的交互路径
+            calls.append(kw.get("auto_download", False))
+            return False                       # 用户答 n 时 ensure_tools 返回 False
+
+        buf = io.StringIO()
+        with mock.patch.object(common, "missing_tools",
+                               lambda keys=common.TOOL_KEYS: list(self._MISSING)), \
+             mock.patch.object(common, "ensure_tools", fake_ensure), \
+             mock.patch.object(common.sys, "stdout", buf), \
+             mock.patch.object(common.sys, "stdin", FakeStdin(True)):
+            common.doctor()
+        # 交互式 → 走 ensure_tools()（它负责问 [y/N]），而不是直接 auto_download=True
+        self.assertEqual(calls, [False])
+
+    def test_non_interactive_does_not_ask(self):
+        calls = []
+        buf = io.StringIO()
+        with mock.patch.object(common, "missing_tools",
+                               lambda keys=common.TOOL_KEYS: list(self._MISSING)), \
+             mock.patch.object(common, "ensure_tools",
+                               lambda *a, **kw: calls.append(kw) or True), \
+             mock.patch.object(common.sys, "stdout", buf), \
+             mock.patch.object(common.sys, "stdin", FakeStdin(False)):
+            common.doctor()
+        self.assertEqual(calls, [])
+
+    def test_flag_downloads_without_asking(self):
+        calls = []
+        buf = io.StringIO()
+        with mock.patch.object(common, "missing_tools",
+                               lambda keys=common.TOOL_KEYS: list(self._MISSING)), \
+             mock.patch.object(common, "ensure_tools",
+                               lambda *a, **kw: calls.append(kw.get("auto_download")) or True), \
+             mock.patch.object(common.sys, "stdout", buf), \
+             mock.patch.object(common.sys, "stdin", FakeStdin(False)):
+            common.doctor(download_tools=True)
+        self.assertEqual(calls, [True])        # --download-tools：直接下，不问
 
 
 class TestRememberProjectPath(unittest.TestCase):

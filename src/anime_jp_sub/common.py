@@ -597,12 +597,22 @@ class Tee:
 
 
 def doctor(download_tools=False):
-    """检查外部依赖是否就位（给命令行用）；download_tools=True 时顺手把缺的装上。"""
+    """检查外部依赖是否就位（给命令行用）。
+
+    外部程序（ffmpeg / MKVToolNix）缺失时：
+      - `--download-tools`：直接下到项目 tools\\，不问
+      - **交互式**（真控制台——`setup.bat` 结尾跑的那次就是）：问一句 [y/N]，答 y 才下
+      - 非交互（脚本 / 管道 / 定时任务）：只报告，绝不下
+    模型**不做自动下载**：缺就打印"去哪个仓库下哪 5 个文件、放到哪个目录"（用户要求手动放）。
+    """
     setup_console()
     print("环境检查：")
     ok = True
     if download_tools:
         ensure_tools(auto_download=True)
+    elif missing_tools() and sys.stdin.isatty():
+        # 装完依赖第一次跑 setup.bat 会走到这里：先问一句，别让用户自己回来找命令
+        ensure_tools()
     for key in TOOL_KEYS:
         p, src = find_tool_info(key)
         if not p:
