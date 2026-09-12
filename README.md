@@ -53,7 +53,7 @@
 去 [python.org](https://www.python.org/downloads/windows/) 下载安装包，安装时**勾上
 「Add Python to PATH」**。装完开一个新的 PowerShell / cmd 窗口，`python -V` 能看到版本号就成。
 
-### 2. 装依赖（双击一下就行）
+### 2. 装依赖
 
 在项目目录（= 你克隆/解压出来的那个文件夹）里**双击 `setup.bat`**，它会自动：
 
@@ -66,18 +66,19 @@
 
 ### 3. 外部程序 ffmpeg + MKVToolNix
 
-**可以让它自己下。**
+**三选一**
 
-交互式运行（双击 `.bat`，或命令行跑 `process`）时如果发现
-机器上没有这两个程序，会问一句 `现在自动下载吗？[y/N]`——答 `y` 就下载到**项目自己的
-`tools\` 目录**（约 200MB）。
+1. 可以让它自己下（见上面第 2 步）。
+2. 在运行`run_jp_sub.bat`时也会检测一遍。
+3. 可以自定义路径：见**config.ini**配置
+
+如果发现机器上没有这两个程序，会问一句 `现在自动下载吗？[y/N]`——答 `y` 就下载到**项目自己的`tools\` 目录**（约 200MB）。
 
 - 只下**缺的那一个**：机器上已经装好的永远优先，不会覆盖、也不改你的 PATH
 - 来源都是官方（ffmpeg 走 gyan.dev，MKVToolNix 走 mkvtoolnix.download），下完会校验 sha256
 - 只写进项目的 `tools\`，不想要了直接删掉这个目录就还原
-- 不是交互式运行时（脚本调用）**只会提示、不会偷偷下**
 
-主动补工具：`run_jp_sub.bat doctor --download-tools`
+> 主动补工具：`run_jp_sub.bat doctor --download-tools`
 
 ### 4. 模型（约 3GB，**要自己下**）
 
@@ -119,7 +120,7 @@ run_jp_sub.bat doctor
 `.bat` 处理的是**它自己所在的文件夹**（复制到哪儿就处理哪儿，会递归找里面的 mkv）。
 
 1. **第一步**：在项目目录里跑：双击项目里的 `run_jp_sub.bat`，它会记忆你的项目目录。
-2. **第二步**：复制到番剧文件夹里双击：把这个 `run_jp_sub.bat` 复制到任何一个番剧 / 季度文件夹里双击都能用，处理的还是它所在的那个文件夹。
+2. **第二步**：复制到番剧文件夹里双击：把这个 `run_jp_sub.bat` 复制到任何一个番剧 / 季度文件夹里双击都能用，处理的还是它所在的那个文件夹（子文件夹里的 mkv 也会一起扫到）。
 
 ### 进阶：命令行
 
@@ -143,11 +144,11 @@ run_jp_sub.bat --keep-srt                 :: 保留中间字幕文件（排查�
 
 ### 常用参数
 
-| 参数 | 作用 |
-|---|---|
+| 参数               | 作用                                                   |
+| ------------------ | ------------------------------------------------------ |
 | `--download-tools` | 缺 ffmpeg / MKVToolNix 时直接下到项目 `tools\`，不再问 |
-| `--no-furigana` | 不生成注音，退回普通日语 SRT 字幕轨 |
-| `--keep-srt` | 保留中间生成的字幕文件（排查问题用，默认用完即删） |
+| `--no-furigana`    | 不生成注音，退回普通日语 SRT 字幕轨                    |
+| `--keep-srt`       | 保留中间生成的字幕文件（排查问题用，默认用完即删）     |
 
 ---
 
@@ -213,15 +214,15 @@ max_chars = 30     ; 每行最多几个字，超过就拆成前后相继的两�
 程序找外部程序的顺序是 **环境变量 → `config.ini` → 系统 PATH → 项目 `tools\`**（先命中先用，
 系统里已经装好的永远优先）。对应的环境变量（优先级比配置文件更高）：
 
-| 环境变量 | 作用 |
-|---|---|
-| `ANIME_JP_SUB_FFMPEG` / `_FFPROBE` / `_MKVMERGE` / `_MKVPROPEDIT` | 指定某个外部程序 |
-| `ANIME_JP_SUB_MODEL_DIR` | 指定模型所在的那一层目录 |
-| `ANIME_JP_SUB_TOOLS_DIR` | 自动下载的外部程序放哪儿 |
-| `ANIME_JP_SUB_LOG_DIR` / `ANIME_JP_SUB_NO_LOG=1` | 换日志位置 / 干脆不写日志 |
-| `ANIME_JP_SUB_FONT` | 换注音用的字体文件 |
-| `ANIME_JP_SUB_CONFIG` | 指定另一份 `config.ini` |
-| `ANIME_JP_SUB_HOME` / `ANIME_JP_SUB_PYTHON` | 告诉 `.bat` 项目在哪 / 用哪个 python.exe |
+| 环境变量                                                     | 作用                                     |
+| ------------------------------------------------------------ | ---------------------------------------- |
+| `ANIME_JP_SUB_FFMPEG` / `_FFPROBE` / `_MKVMERGE` / `_MKVPROPEDIT` | 指定某个外部程序                         |
+| `ANIME_JP_SUB_MODEL_DIR`                                     | 指定模型所在的那一层目录                 |
+| `ANIME_JP_SUB_TOOLS_DIR`                                     | 自动下载的外部程序放哪儿                 |
+| `ANIME_JP_SUB_LOG_DIR` / `ANIME_JP_SUB_NO_LOG=1`             | 换日志位置 / 干脆不写日志                |
+| `ANIME_JP_SUB_FONT`                                          | 换注音用的字体文件                       |
+| `ANIME_JP_SUB_CONFIG`                                        | 指定另一份 `config.ini`                  |
+| `ANIME_JP_SUB_HOME` / `ANIME_JP_SUB_PYTHON`                  | 告诉 `.bat` 项目在哪 / 用哪个 python.exe |
 
 > 配了却不生效？多半是放错位置了——全局的 `config.ini` 要放**项目根目录**，不是 `src\` 里面。
 
@@ -336,25 +337,24 @@ qBittorrent 正在做种、占着文件句柄。暂停那个任务（或退出 q
   都有中文轨；只有日文/英文字幕的片源不建议用——能跑，但断句会变差。
 - `.mkv` 大多是内封或原盘；`.mp4` 常见内嵌硬字幕（提不出来）。
 - 标题写「**简繁日内封字幕**」的通常内封了日文轨，**可以直接用**；
-  写「**简日内嵌**」的是中日都烧进画面（方便但提不出）。
-- 内封派组例如 LoliHouse / 喵萌奶茶屋 / SweetSub；内嵌派组例如 TSDM / 北宇治 / 桜都。
+  写「**简日内嵌**」的不能直接用。
 
 ---
 
 ## 项目目录里都有什么
 
-| 文件 / 目录 | 作用 |
-|---|---|
-| `setup.bat` | 首次安装：双击一下，自动建 `.venv` + 装依赖 + 自检 |
-| `run_jp_sub.py` / `run_jp_sub.bat` | 入口（`.bat` 是双击用的启动器，处理它所在的文件夹） |
-| `src\anime_jp_sub\` | 程序本体 |
-| `src\anime_jp_sub\fonts\` | 自带的注音字体 M PLUS 1 Code（OFL 许可，会内附进 mkv） |
-| `requirements.txt` | Python 依赖清单 |
-| `config.example.ini` | 配置样例，复制成 `config.ini` 生效 |
-| `models\` | 你自己下的 whisper 模型（约 3GB，git 忽略） |
-| `tools\` | 自动下载的 ffmpeg / MKVToolNix（git 忽略，删掉即还原） |
-| `.venv\` | Python 虚拟环境（git 忽略） |
-| `anime_jp_sub.log`、`furigana_dict.txt` | 运行日志、番剧的人名读音词典（生成在番剧文件夹里） |
+| 文件 / 目录                             | 作用                                                   |
+| --------------------------------------- | ------------------------------------------------------ |
+| `setup.bat`                             | 首次安装：双击一下，自动建 `.venv` + 装依赖 + 自检     |
+| `run_jp_sub.py` / `run_jp_sub.bat`      | 入口（`.bat` 是双击用的启动器，处理它所在的文件夹）    |
+| `src\anime_jp_sub\`                     | 程序本体                                               |
+| `src\anime_jp_sub\fonts\`               | 自带的注音字体 M PLUS 1 Code（OFL 许可，会内附进 mkv） |
+| `requirements.txt`                      | Python 依赖清单                                        |
+| `config.example.ini`                    | 配置样例，复制成 `config.ini` 生效                     |
+| `models\`                               | 你自己下的 whisper 模型（约 3GB，git 忽略）            |
+| `tools\`                                | 自动下载的 ffmpeg / MKVToolNix（git 忽略，删掉即还原） |
+| `.venv\`                                | Python 虚拟环境（git 忽略）                            |
+| `anime_jp_sub.log`、`furigana_dict.txt` | 运行日志、番剧的人名读音词典（生成在番剧文件夹里）     |
 
 ---
 
