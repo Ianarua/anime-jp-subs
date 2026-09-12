@@ -95,17 +95,18 @@ model.bin      config.json      tokenizer.json      preprocessor_config.json    
 **仓库别认错**：要的是 **CTranslate2 格式**的 `Systran/faster-whisper-large-v3`。
 （`openai/whisper-large-v3` 是 Transformers 格式，里面**没有 `model.bin`**，faster-whisper 用不了。）
 
-下载地址形如（国内连不上 huggingface.co 就把域名换成镜像 `hf-mirror.com`）：
+下载地址：
 
 ```
-https://hf-mirror.com/Systran/faster-whisper-large-v3/resolve/main/<文件名>
+原站：https://huggingface.co/Systran/faster-whisper-large-v3/tree/main
+国内镜像：https://hf-mirror.com/Systran/faster-whisper-large-v3/tree/main
 ```
 
 ### 5. 自检
 
-```bat
-run_jp_sub.bat doctor
-```
+方法一：`run_jp_sub.bat doctor`
+方法二：双击`setup.bat`
+
 
 它会逐项报出 `ffmpeg / ffprobe / mkvmerge / mkvpropedit`、Python 包、模型目录在不在，
 并且**写明每个程序是从哪找来的**（环境变量 / config.ini / 系统 PATH / 项目 tools/）。
