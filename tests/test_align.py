@@ -31,6 +31,32 @@ class TestAlignTimeline(unittest.TestCase):
         self.assertEqual(ajs.align_timeline(segs, self.CN, 15.0, 30.0),
                          [(20.0, 21.8, "とお")])
 
+    def test_head_fragment_moves_to_next_line(self):
+        """中文边界切在词内部（ス|ポーツ）→ 前半截要挪回下一句。
+
+        用户实测：片假名/汉字词被 BPE 切成两段后，前半截挂在上一句末尾
+        （一集几十处：実|は、学|院、あ|なた、五|木…）。
+        """
+        segs = [(29.0, 31.0, "x", [(30.0, 30.5, "ス"), (30.5, 31.0, "ポーツ")])]
+        cn = [(28.0, 30.4), (30.4, 31.5)]
+        self.assertEqual(ajs.align_timeline(segs, cn, 31.5, 31.5),
+                         [(30.4, 31.5, "スポーツ")])   # 上一句空了 → 不留空条目
+
+    def test_sentence_final_particle_is_not_moved(self):
+        """上一句句尾是助動詞/助詞（だ・な）时不能挪：だ|が 拼起来是 だが，
+        但那多半是两句的分界（上一句的句尾），搬走会把上一句弄残。"""
+        segs = [(0.0, 1.0, "x", [(0.2, 0.5, "だ"), (0.5, 0.9, "が")])]
+        cn = [(0.0, 0.55), (0.55, 1.2)]
+        self.assertEqual(ajs.align_timeline(segs, cn, 1.2, 1.2),
+                         [(0.0, 0.55, "だ"), (0.55, 1.2, "が")])
+
+    def test_pause_blocks_the_repair(self):
+        """两个碎片中间有明显停顿 → 本来就是两个词，别硬拼起来。"""
+        segs = [(0.0, 2.0, "x", [(0.2, 0.5, "実"), (0.9, 1.3, "は")])]
+        cn = [(0.0, 0.55), (0.55, 1.5)]
+        self.assertEqual(ajs.align_timeline(segs, cn, 1.5, 1.5),
+                         [(0.0, 0.55, "実"), (0.55, 1.5, "は")])
+
     def test_no_timeline_falls_back_to_word_time(self):
         """片源没有中文字幕轨时，按词级时间成条（不能整段吸附到空气上）。"""
         segs = [(20.0, 22.0, "x", [(20.0, 20.7, "と"), (21.0, 21.8, "お")])]

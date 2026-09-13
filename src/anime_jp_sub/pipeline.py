@@ -81,6 +81,46 @@ VAD_FILTER = True
 # 判定为"中文"字幕轨的语言标签(含简繁体常见变体)
 CHINESE_LANGS = ("chi", "zh", "chs", "cht", "zh-cn", "zh-tw", "zh-hans", "zh-hant")
 
+# 断句修复用：Whisper 给的是 BPE 碎片，日语没有空格，一个词常被切成 2 段
+# （スポーツ→ス+ポーツ、実は→実+は）。中文边界正好切在词内部时，前半截会挂到上一句末尾。
+GAP_WORD = 0.15        # 两个碎片最多隔多久还算"挨着"（同一个词被切开的典型特征）
+CUT_SLACK = 0.12       # 中文边界最多贴到碎片末尾多远，仍算"切在词内部"
+_PUNCT = "、。！？…「」『』，．,.!?（()）"
+_JANOME = None
+
+
+def _janome():
+    """懒加载 Janome（只用它判断"两个碎片拼起来是不是一个词"）。"""
+    global _JANOME
+    if _JANOME is None:
+        from janome.tokenizer import Tokenizer
+        _JANOME = Tokenizer()
+    return _JANOME
+
+
+def _joined_one_word(a, b):
+    """a 末尾 + b 开头 拼起来在 Janome 里是"一个词"吗。"""
+    if not a or not b or a[-1] in _PUNCT or b[0] in _PUNCT:
+        return False
+    joined = a + b
+    try:
+        toks = list(_janome().tokenize(joined))
+    except Exception:                               # noqa: BLE001
+        return False
+    return len(toks) == 1 and toks[0].surface == joined
+
+
+def _is_bound_tail(t):
+    """t 自己是贴在前面的助詞/助動詞（だ・な・ね 之类）——它可能就是上一句的正常句尾，
+    这种不动，免得把上一句的句尾搬到下一句去。"""
+    try:
+        toks = list(_janome().tokenize(t))
+    except Exception:                               # noqa: BLE001
+        return False
+    if len(toks) != 1:
+        return False
+    return toks[0].part_of_speech.split(",")[0] in ("助詞", "助動詞")
+
 
 def ffprobe_error(mkv):
     """ffprobe 失败的**原因**。解析时用的是 -v quiet（避免警告混进 JSON），
@@ -331,6 +371,27 @@ def align_timeline(segments, timeline, max_end=0.0, audio_dur=0.0):
             groups[-1][1].append(w)
         else:
             groups.append((i, [w]))
+
+    # 2.5) 边界修复：中文断句边界如果切在某个日语词的内部，前半截会挂在上一句末尾
+    #      （实测：実|は、学|院、あ|なた、五|木、将|来…，一集里几十处）。把这一半
+    #      挪回下一句——它只是那个词的开头，词的后半截本来就在下一句。
+    for k in range(len(groups) - 1):
+        i, wa = groups[k]
+        j, wb = groups[k + 1]
+        if not wa or not wb or i is None or j is None or i >= j:
+            continue
+        a, b = wa[-1], wb[0]
+        if b[0] - a[1] > GAP_WORD:                    # 中间有明显停顿 → 本来就是两个词
+            continue
+        if not _joined_one_word(a[2], b[2]):          # 拼起来不是一个词 → 不动
+            continue
+        cut = ivs[i][1]                               # 这一条中文的结束 = 下一条的开始
+        if not (a[0] <= cut <= a[1] + CUT_SLACK):     # 边界没切在这个碎片上 → 不动
+            continue
+        if _is_bound_tail(a[2]):                      # 可能是上一句的正常句尾（な/だ/ね…）
+            continue
+        wa.pop()
+        wb.insert(0, a)
 
     entries = []
     for i, ws in groups:
