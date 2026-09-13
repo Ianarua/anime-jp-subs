@@ -83,6 +83,22 @@ class TestAlignTimeline(unittest.TestCase):
         out = ajs.align_timeline(segs, cn, 1.2, 1.2)
         self.assertEqual([t for _s, _e, t in out], ["問題", "のに"])
 
+    def test_interjection_straddling_the_cut_moves_to_next_line(self):
+        """跨在边界上的「いや」（感動詞）是下一句的开头，不可能给上一句收尾。
+        用户实测：2:30 的「いや」被挂到了上一句末尾。"""
+        segs = [(147.0, 152.5, "x", [(150.38, 150.66, "って"), (150.66, 151.52, "いや"),
+                                     (151.52, 152.04, "ちょっと")])]
+        cn = [(147.48, 151.40), (151.40, 153.52)]
+        out = ajs.align_timeline(segs, cn, 153.52, 153.52)
+        self.assertEqual([t for _s, _e, t in out], ["って", "いやちょっと"])
+
+    def test_interjection_inside_the_line_is_kept(self):
+        """没跨在边界上的感動詞不挪：它整段都在上一条里，就是上一条的内容。"""
+        segs = [(0.0, 1.4, "x", [(0.2, 0.5, "うん"), (0.51, 0.9, "そうだね")])]
+        cn = [(0.0, 0.6), (0.6, 1.4)]
+        out = ajs.align_timeline(segs, cn, 1.4, 1.4)
+        self.assertEqual([t for _s, _e, t in out], ["うん", "そうだね"])
+
     def test_no_timeline_falls_back_to_word_time(self):
         """片源没有中文字幕轨时，按词级时间成条（不能整段吸附到空气上）。"""
         segs = [(20.0, 22.0, "x", [(20.0, 20.7, "と"), (21.0, 21.8, "お")])]

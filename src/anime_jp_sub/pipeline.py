@@ -345,12 +345,25 @@ def extract_timeline_base(mkv):
     return timeline, max_end, base_lang
 
 
+def _starts_sentence(t):
+    """t 是不是"只会出现在句首"的词：いや・ええ・うん・まあ（感動詞），
+    えーと・あの（フィラー），でも・だから（接続詞）。这种词不可能给上一句收尾。"""
+    try:
+        toks = list(_janome().tokenize(t))
+    except Exception:                               # noqa: BLE001
+        return False
+    if len(toks) != 1 or toks[0].surface != t:
+        return False
+    return toks[0].part_of_speech.split(",")[0] in ("感動詞", "接続詞", "フィラー")
+
+
 def _repair_boundaries(groups, ivs, debug=False):
     """边界修复：中文断句边界和日语的"词/短语"边界不重合时，上一条末尾那个碎片
     其实只是某个词的开头，要把它挪到下一句。两种形态：
 
       ① 词被切两半：  …思う|ス   +   ポーツ|…      → 挪「ス」
       ② 下一条从格助詞开头：…ですか|俺 + が|…        → 挪「俺」
+      ③ 碎片跨在边界上、而且是个只会起句的词：…|いや + そんな|…  → 挪「いや」
 
     只在交界处动**一个**碎片；句尾是助詞/助動詞（だ・な・ね）时不动，
     中间有明显停顿时也不动。
@@ -367,16 +380,18 @@ def _repair_boundaries(groups, ivs, debug=False):
         word_cut = (a[0] <= cut <= a[1] + CUT_SLACK) and _joined_one_word(a[2], b[2])
         particle_cut = (a[0] <= cut <= b[1] + CUT_SLACK) \
             and _next_starts_with_particle(a[2], right_head)
+        interjection_cut = (a[0] < cut < a[1]) and _starts_sentence(a[2])
         why = None
         if gap > GAP_WORD:
             why = f"中间有停顿(gap={gap:.2f})"
         elif _is_bound_tail(a[2]):
             why = "上一句句尾是助詞/助動詞"
-        elif not (word_cut or particle_cut):
-            why = "两条规则都不满足"
+        elif not (word_cut or particle_cut or interjection_cut):
+            why = "三条规则都不满足"
         if debug:
             print(f"  [dbg] a={a[2]!r}[{a[0]:.2f}-{a[1]:.2f}] b={b[2]!r}[{b[0]:.2f}-{b[1]:.2f}] "
-                  f"cut={cut:.2f} gap={gap:.2f} 词={word_cut} 助詞={particle_cut} → {why or '挪'}")
+                  f"cut={cut:.2f} gap={gap:.2f} 词={word_cut} 助詞={particle_cut} "
+                  f"起句词={interjection_cut} → {why or '挪'}")
         if why:
             continue
         wa.pop()
