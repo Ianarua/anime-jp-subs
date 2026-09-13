@@ -57,6 +57,32 @@ class TestAlignTimeline(unittest.TestCase):
         self.assertEqual(ajs.align_timeline(segs, cn, 1.5, 1.5),
                          [(0.0, 0.55, "実"), (0.55, 1.5, "は")])
 
+    def test_next_line_starting_with_particle(self):
+        """下一条从格助詞开头（…俺|が…）→ 句子不可能这么开头，把「俺」挪过去。
+
+        用户实测：1:48 的「俺」和「が」被切成两条字幕。
+        """
+        segs = [(109.0, 110.5, "x", [(109.46, 110.16, "俺"), (110.16, 110.94, "が")])]
+        cn = [(106.15, 110.40), (110.40, 111.73)]
+        self.assertEqual(ajs.align_timeline(segs, cn, 111.73, 111.73),
+                         [(110.40, 111.73, "俺が")])
+
+    def test_renyotai_no_is_also_a_particle_start(self):
+        """「の」是助詞,連体化（Janome 不叫格助詞）——同样不可能起句：家|の仕事で。"""
+        segs = [(313.0, 315.0, "x", [(313.37, 314.17, "家"), (314.17, 314.39, "の"),
+                                     (314.39, 314.61, "仕"), (314.61, 314.73, "事")])]
+        cn = [(311.85, 314.06), (314.06, 317.23)]
+        self.assertEqual(ajs.align_timeline(segs, cn, 317.23, 317.23),
+                         [(314.06, 317.23, "家の仕事")])
+
+    def test_line_starting_with_conjunctive_particle_is_kept(self):
+        """下一条以「のに/ても/から」这类接続助詞开头是可能的（口语常见）→ 不能挪。
+        白名单只认"不可能起句"的助詞（格助詞/係助詞/連体化/準体/副助詞）。"""
+        segs = [(0.0, 1.2, "x", [(0.2, 0.5, "問題"), (0.6, 0.9, "のに")])]
+        cn = [(0.0, 0.55), (0.55, 1.2)]
+        out = ajs.align_timeline(segs, cn, 1.2, 1.2)
+        self.assertEqual([t for _s, _e, t in out], ["問題", "のに"])
+
     def test_no_timeline_falls_back_to_word_time(self):
         """片源没有中文字幕轨时，按词级时间成条（不能整段吸附到空气上）。"""
         segs = [(20.0, 22.0, "x", [(20.0, 20.7, "と"), (21.0, 21.8, "お")])]

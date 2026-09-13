@@ -86,6 +86,9 @@ CHINESE_LANGS = ("chi", "zh", "chs", "cht", "zh-cn", "zh-tw", "zh-hans", "zh-han
 GAP_WORD = 0.15        # 两个碎片最多隔多久还算"挨着"（同一个词被切开的典型特征）
 CUT_SLACK = 0.12       # 中文边界最多贴到碎片末尾多远，仍算"切在词内部"
 _PUNCT = "、。！？…「」『』，．,.!?（()）"
+# 这些助詞不可能出现在一行字幕的开头：格助詞（が・を・に・へ…）、係助詞（は・も）、
+# 連体化の、準体助詞の、副助詞（だけ・しか・ほど…）。出现就说明中文句界切错地方了。
+_NO_LINE_START_PARTICLES = ("格助詞", "係助詞", "連体化", "準体助詞", "副助詞")
 _JANOME = None
 
 
@@ -120,6 +123,36 @@ def _is_bound_tail(t):
     if len(toks) != 1:
         return False
     return toks[0].part_of_speech.split(",")[0] in ("助詞", "助動詞")
+
+
+def _next_starts_with_particle(a, right_head):
+    """下一条字幕开头是不是**格助詞/係助詞**（が・を・に・へ・で・と・は・も…）。
+
+    句子不可能从格助詞开头，所以出现这种情况说明中文句界切错地方了——前一个词
+    应该跟过去（实测：「…ですか俺」+「が」= 应该是「俺が」）。
+    只认格助詞/係助詞：なあ/ても/のに 这类开头的句子是真的存在，不能动。
+
+    做法：把 a 拼到下一句前面，看 a 后面紧跟的那个 token 是不是格助詞/係助詞。
+    （Janome 有时会把 a 和助詞合成一个 token，比如「家の」，那也算。）
+    """
+    try:
+        toks = list(_janome().tokenize(a + right_head))
+    except Exception:                               # noqa: BLE001
+        return False
+    pos = 0
+    for idx, t in enumerate(toks):
+        end = pos + len(t.surface)
+        if idx == 0 and end > len(a):               # a + 助詞 被合成了一个词（家の）
+            return t.surface.startswith(a)
+        if end == len(a):
+            if idx + 1 >= len(toks):
+                return False
+            pos2 = toks[idx + 1].part_of_speech.split(",")
+            return pos2[0] == "助詞" and pos2[1] in _NO_LINE_START_PARTICLES
+        if end > len(a):
+            return False                            # a 被切进了别的词里
+        pos = end
+    return False
 
 
 def ffprobe_error(mkv):
@@ -312,6 +345,44 @@ def extract_timeline_base(mkv):
     return timeline, max_end, base_lang
 
 
+def _repair_boundaries(groups, ivs, debug=False):
+    """边界修复：中文断句边界和日语的"词/短语"边界不重合时，上一条末尾那个碎片
+    其实只是某个词的开头，要把它挪到下一句。两种形态：
+
+      ① 词被切两半：  …思う|ス   +   ポーツ|…      → 挪「ス」
+      ② 下一条从格助詞开头：…ですか|俺 + が|…        → 挪「俺」
+
+    只在交界处动**一个**碎片；句尾是助詞/助動詞（だ・な・ね）时不动，
+    中间有明显停顿时也不动。
+    """
+    for k in range(len(groups) - 1):
+        i, wa = groups[k]
+        j, wb = groups[k + 1]
+        if not wa or not wb or i is None or j is None or i >= j:
+            continue
+        a, b = wa[-1], wb[0]
+        gap = b[0] - a[1]
+        cut = ivs[i][1]                     # 这一条中文的结束 = 下一条的开始
+        right_head = "".join(w[2] for w in wb)[:10]
+        word_cut = (a[0] <= cut <= a[1] + CUT_SLACK) and _joined_one_word(a[2], b[2])
+        particle_cut = (a[0] <= cut <= b[1] + CUT_SLACK) \
+            and _next_starts_with_particle(a[2], right_head)
+        why = None
+        if gap > GAP_WORD:
+            why = f"中间有停顿(gap={gap:.2f})"
+        elif _is_bound_tail(a[2]):
+            why = "上一句句尾是助詞/助動詞"
+        elif not (word_cut or particle_cut):
+            why = "两条规则都不满足"
+        if debug:
+            print(f"  [dbg] a={a[2]!r}[{a[0]:.2f}-{a[1]:.2f}] b={b[2]!r}[{b[0]:.2f}-{b[1]:.2f}] "
+                  f"cut={cut:.2f} gap={gap:.2f} 词={word_cut} 助詞={particle_cut} → {why or '挪'}")
+        if why:
+            continue
+        wa.pop()
+        wb.insert(0, a)
+
+
 def align_timeline(segments, timeline, max_end=0.0, audio_dur=0.0):
     """按中文字幕的断句边界切分 Whisper 的输出（词级时间）。
 
@@ -372,26 +443,8 @@ def align_timeline(segments, timeline, max_end=0.0, audio_dur=0.0):
         else:
             groups.append((i, [w]))
 
-    # 2.5) 边界修复：中文断句边界如果切在某个日语词的内部，前半截会挂在上一句末尾
-    #      （实测：実|は、学|院、あ|なた、五|木、将|来…，一集里几十处）。把这一半
-    #      挪回下一句——它只是那个词的开头，词的后半截本来就在下一句。
-    for k in range(len(groups) - 1):
-        i, wa = groups[k]
-        j, wb = groups[k + 1]
-        if not wa or not wb or i is None or j is None or i >= j:
-            continue
-        a, b = wa[-1], wb[0]
-        if b[0] - a[1] > GAP_WORD:                    # 中间有明显停顿 → 本来就是两个词
-            continue
-        if not _joined_one_word(a[2], b[2]):          # 拼起来不是一个词 → 不动
-            continue
-        cut = ivs[i][1]                               # 这一条中文的结束 = 下一条的开始
-        if not (a[0] <= cut <= a[1] + CUT_SLACK):     # 边界没切在这个碎片上 → 不动
-            continue
-        if _is_bound_tail(a[2]):                      # 可能是上一句的正常句尾（な/だ/ね…）
-            continue
-        wa.pop()
-        wb.insert(0, a)
+    # 2.5) 边界修复（见 _repair_boundaries）
+    _repair_boundaries(groups, ivs)
 
     entries = []
     for i, ws in groups:
