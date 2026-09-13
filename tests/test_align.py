@@ -225,6 +225,7 @@ class TestCudaFallback(unittest.TestCase):
         self.assertFalse(ajs._cuda_runtime_error(ValueError("bad srt")))
 
     def _fake_module(self, used, boom_on_cuda=True, other_error=False):
+        import dataclasses
         import types
 
         class FakeModel:
@@ -239,14 +240,27 @@ class TestCudaFallback(unittest.TestCase):
             def transcribe(self, *a, **kw):
                 return iter([]), types.SimpleNamespace(duration=10.0)
 
+        @dataclasses.dataclass
+        class FakeVadOptions:      # 只要能被 dataclasses.asdict() 吃掉就行
+            threshold: float = 0.5
+            min_speech_duration_ms: int = 0
+            max_speech_duration_s: float = 0.0
+            min_silence_duration_ms: int = 2000
+            speech_pad_ms: int = 400
+
+        vad = types.ModuleType("faster_whisper.vad")
+        vad.VadOptions = FakeVadOptions
         mod = types.ModuleType("faster_whisper")
         mod.WhisperModel = FakeModel
+        mod.vad = vad
         return mod
 
     def test_falls_back_to_cpu_when_cuda_fails(self):
         from unittest import mock
         used = []
-        with mock.patch.dict(sys.modules, {"faster_whisper": self._fake_module(used)}), \
+        mod = self._fake_module(used)
+        with mock.patch.dict(sys.modules, {"faster_whisper": mod,
+                                           "faster_whisper.vad": mod.vad}), \
              mock.patch.object(ajs, "pick_device", lambda: ("cuda", "int8")):
             segs, dur, _qa = ajs.transcribe("x.wav", [], 10.0)
         self.assertEqual(used, ["cuda", "cpu"])       # 先试 CUDA，失败后自动 CPU
@@ -256,8 +270,9 @@ class TestCudaFallback(unittest.TestCase):
     def test_unrelated_errors_are_not_swallowed(self):
         from unittest import mock
         used = []
-        with mock.patch.dict(sys.modules,
-                             {"faster_whisper": self._fake_module(used, other_error=True)}), \
+        mod = self._fake_module(used, other_error=True)
+        with mock.patch.dict(sys.modules, {"faster_whisper": mod,
+                                           "faster_whisper.vad": mod.vad}), \
              mock.patch.object(ajs, "pick_device", lambda: ("cuda", "int8")):
             with self.assertRaises(RuntimeError) as cm:
                 ajs.transcribe("x.wav", [], 10.0)

@@ -30,12 +30,14 @@ anime-jp-sub  --  给日语 mkv 自动生成并内封日语字幕
 """
 
 import argparse
+import dataclasses
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 
 from . import common   # 工具路径解析 + 子进程 + 时间戳（见 common.py）
@@ -77,6 +79,15 @@ MODEL_SIZE = "large-v3"
 COMPUTE_TYPE = "int8"     # 6G 显存，int8 最省
 BEAM_SIZE = 1             # greedy 最快
 VAD_FILTER = True
+# 听写时"按换气切块"的参数（不是 detect_pauses 那套，两处的用途不同）：
+#   min_silence_duration_ms: faster-whisper 默认 2000ms —— 说话中间 0.3~0.7s 的换气
+#     会被并进同一块，块内的 DTW 就把词级时间拉歪了（实测词缝和真停顿偏移中位 +0.28s）。
+#     改成 250ms 后偏移降到 -0.07s，±0.15s 命中率 45/525 → 318/525（见 README/AGENTS）。
+#   speech_pad_ms: 默认 400ms 会把前后静音也切进块里，缩到 50ms 让边界贴住真停顿。
+#   max_speech_duration_s: 8s，防止一口气说很长时一整段不分块。
+VAD_PARAMS = {"threshold": 0.5, "min_speech_duration_ms": 100,
+              "max_speech_duration_s": 8.0, "min_silence_duration_ms": 250,
+              "speech_pad_ms": 50}
 
 # 判定为"中文"字幕轨的语言标签(含简繁体常见变体)
 CHINESE_LANGS = ("chi", "zh", "chs", "cht", "zh-cn", "zh-tw", "zh-hans", "zh-hant")
@@ -92,6 +103,25 @@ _NO_LINE_START_PARTICLES = ("格助詞", "係助詞", "連体化", "準体助詞
 _JANOME = None
 
 
+def _is_particle_like(pos, index):
+    """Janome 的助詞子类可能是「副助詞／並立助詞／終助詞」这种斜杠串，要按串里的每一项比。"""
+    return pos[0] == "助詞" and index < len(pos) and \
+        any(sub in pos[index].split("／") for sub in _NO_LINE_START_PARTICLES)
+
+
+def _false_particle(toks, i):
+    """这个"助詞"其实是**某个词被拆开的前半截**吗——Janome 把「という」拆成
+    `と`(格助詞,引用)+`いう`(動詞)，不拦的话「という」开头的行会被当成"助詞起句"，
+    白吃一笔重罚（实测就是它把「…ですか。というか、俺…」硬断成「…ですという」「か俺…」）。
+    """
+    if i < 0 or i >= len(toks) or toks[i].surface != "と":
+        return False
+    if i + 1 >= len(toks):
+        return False
+    nxt = toks[i + 1]
+    return nxt.part_of_speech.split(",")[0] == "動詞" and nxt.base_form in ("いう", "言う")
+
+
 def _janome():
     """懒加载 Janome（只用它判断"两个碎片拼起来是不是一个词"）。"""
     global _JANOME
@@ -101,6 +131,7 @@ def _janome():
     return _JANOME
 
 
+@lru_cache(maxsize=8192)
 def _joined_one_word(a, b):
     """a 末尾 + b 开头 拼起来在 Janome 里是"一个词"吗。"""
     if not a or not b or a[-1] in _PUNCT or b[0] in _PUNCT:
@@ -113,6 +144,7 @@ def _joined_one_word(a, b):
     return len(toks) == 1 and toks[0].surface == joined
 
 
+@lru_cache(maxsize=8192)
 def _is_bound_tail(t):
     """t 自己是贴在前面的助詞/助動詞（だ・な・ね 之类）——它可能就是上一句的正常句尾，
     这种不动，免得把上一句的句尾搬到下一句去。"""
@@ -125,6 +157,7 @@ def _is_bound_tail(t):
     return toks[0].part_of_speech.split(",")[0] in ("助詞", "助動詞")
 
 
+@lru_cache(maxsize=8192)
 def _next_starts_with_particle(a, right_head):
     """下一条字幕开头是不是**格助詞/係助詞**（が・を・に・へ・で・と・は・も…）。
 
@@ -147,8 +180,9 @@ def _next_starts_with_particle(a, right_head):
         if end == len(a):
             if idx + 1 >= len(toks):
                 return False
-            pos2 = toks[idx + 1].part_of_speech.split(",")
-            return pos2[0] == "助詞" and pos2[1] in _NO_LINE_START_PARTICLES
+            if _false_particle(toks, idx + 1):
+                return False
+            return _is_particle_like(toks[idx + 1].part_of_speech.split(","), 1)
         if end > len(a):
             return False                            # a 被切进了别的词里
         pos = end
@@ -345,6 +379,7 @@ def extract_timeline_base(mkv):
     return timeline, max_end, base_lang
 
 
+@lru_cache(maxsize=8192)
 def _starts_sentence(t):
     """t 是不是"只会出现在句首"的词：いや・ええ・うん・まあ（感動詞），
     えーと・あの（フィラー），でも・だから（接続詞）。这种词不可能给上一句收尾。"""
@@ -517,12 +552,16 @@ def _cuda_runtime_error(exc):
 def _transcribe_once(device, compute_type, wav_path, max_end):
     """跑一遍听写（加载模型 + 消费完整个生成器），返回 (每段原始结果, 音频总长)。
     ⚠ 一定要在这里就把生成器消费掉：faster-whisper 的 transcribe() 返回的是**生成器**，
-    CUDA 缺 DLL 那种错误是取第一条结果时才炸出来的，光 try 住 transcribe() 没用（踩过）。"""
+    CUDA 缺 DLL 那种错误是取第一条结果时才炸出来的，光 try 住 transcribe() 没用（踩过）。
+    ⚠ VAD 参数走 VAD_PARAMS（min_silence 从默认 2000ms 缩到 250ms）：默认参数下说话
+    中间的换气会被并进同一块，词级时间被块内 DTW 拉歪，断句就跟真停顿对不上了。"""
     from faster_whisper import WhisperModel
+    from faster_whisper.vad import VadOptions
     print(f"  [转写] 加载模型 large-v3（{device} / {compute_type}）...", flush=True)
     model = WhisperModel(model_path(), device=device, compute_type=compute_type)
     segments, info = model.transcribe(
         str(wav_path), language=LANG, beam_size=BEAM_SIZE, vad_filter=VAD_FILTER,
+        vad_parameters=dataclasses.asdict(VadOptions(**VAD_PARAMS)),
         word_timestamps=True, condition_on_previous_text=False,
     )
     total_dur = float(info.duration or 0.0) or float(max_end or 0.0)
@@ -545,7 +584,425 @@ def _transcribe_once(device, compute_type, wav_path, max_end):
     return seg_list, total_dur
 
 
-def transcribe(wav_path, timeline, max_end):
+# ===== 日语自己断句（不再依赖中文字幕轨） =====
+# 以前拿中文轨的断句当基准：好处是"人类翻译的断句比 whisper 的段边界靠谱"，
+# 代价是把日语切在翻译的断点上（半个词、行首助詞、感動詞跨行…）。用户只看日语轨，
+# 所以改成"听日语自己的呼吸"：
+#   silero VAD 实测停顿 → 停顿落到词缝上 → DP 按"单行宽度"拼行 → 时间用语音段做骨架
+LINE_WIDTH_RATIO = 0.80      # 单行最多占画面宽度的比例（别占满屏，也绝不能折成两行）
+HOLD_AFTER = 0.0             # 这句话说完后字幕再停留多久（秒）
+                             # 用户 2026-09 定的：不用停留，说完就消失（觉得 1 秒太拖）。
+                             # MIN_SHOW 仍然是下限，免得一闪而过看不清。
+MIN_SHOW = 0.6               # 一行至少显示多久（秒）
+PAUSE_CAND = 0.15            # 候选停顿：静音 >= 0.15s
+PAUSE_STRONG = 0.30          # 强停顿：静音 >= 0.3s（优先在这儿断行）
+LEAD_IN = 0.05               # 字幕比语音早一点点出现
+SNAP_TOL = 0.60              # whisper 的段边界离停顿多远以内，就认它是同一个断点
+                             # （实测 80% 在 0.3s 内、98% 在 0.6s 内）
+INNER_PAUSE_MIN = 3.5        # 段内停顿只有当这一段词时长 >= 3.5s（一行肯定放不下）才算切点
+_END_PUNCT = "。！？!?…"
+
+
+def detect_pauses(wav_path, threshold=0.5, min_silence=PAUSE_CAND):
+    """用 silero VAD（faster-whisper 自带，不用装新东西）从音频里找"换气/停顿"。
+    返回 (语音段列表, 停顿列表)；拿不到就返回 ([], [])，调用方退回 whisper 词间间隔。
+    语音段给"字幕什么时候出现/消失"当骨架，停顿给"在哪儿断行"当候选。"""
+    try:
+        from faster_whisper.audio import decode_audio
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+    except Exception:                               # noqa: BLE001
+        return [], []
+    try:
+        audio = decode_audio(str(wav_path), sampling_rate=16000)
+        opts = VadOptions(threshold=threshold,
+                          min_silence_duration_ms=int(min_silence * 1000),
+                          min_speech_duration_ms=100, speech_pad_ms=0)
+        raw = get_speech_timestamps(audio, opts, sampling_rate=16000)
+    except Exception as e:                          # noqa: BLE001
+        print(f"  [warn] VAD 停顿检测失败（{e}），退回用 whisper 的词间间隔")
+        return [], []
+    spans = [(s["start"] / 16000.0, s["end"] / 16000.0) for s in raw]
+    gaps = [(spans[i][1], spans[i + 1][0], spans[i + 1][0] - spans[i][1])
+            for i in range(len(spans) - 1)]
+    return spans, [g for g in gaps if g[2] > 0]
+
+
+def _line_width(text, main_px):
+    """这一行渲染出来有多宽（像素）。用字体文件的真实字宽算，不猜 1em/0.5em。"""
+    if not HAVE_FURIGANA:
+        return len(text) * main_px                  # 没字体度量时按全角估
+    return furigana.text_em(text) * main_px
+
+
+@lru_cache(maxsize=8192)
+def _bad_line_start(text):
+    """行首是不该起句的助詞吗（格助詞・係助詞・連体化の・準体助詞・副助詞）。"""
+    if not text:
+        return False
+    try:
+        toks = list(_janome().tokenize(text[:4]))
+    except Exception:                               # noqa: BLE001
+        return False
+    if not toks:
+        return False
+    if _false_particle(toks, 0):
+        return False
+    return _is_particle_like(toks[0].part_of_speech.split(","), 1)
+
+
+@lru_cache(maxsize=8192)
+def _looks_like_line_end(text):
+    """行尾像一句话的结束吗（句末标点 / 助動詞・動詞・形容詞・感動詞）。"""
+    if not text:
+        return False
+    if text[-1] in _END_PUNCT:
+        return True
+    try:
+        toks = list(_janome().tokenize(text[-6:]))
+    except Exception:                               # noqa: BLE001
+        return False
+    if not toks:
+        return False
+    pos = toks[-1].part_of_speech.split(",")
+    return pos[0] in ("助動詞", "動詞", "形容詞", "感動詞")
+
+
+@lru_cache(maxsize=8192)
+def _ends_with_sentence_starter(text):
+    """这句是不是以"只会出现在句首"的词结尾（いや・あの・でも…）。
+
+    这种词不可能给上一句收尾：实测「…興味ないのかなっていや」被断在「いや」后面，
+    听感上「いや」是和下一句「そんなことないです」连着的。
+    ⚠ 只取**最后一个 token**判断，不能拿尾巴去 _starts_sentence（那要求整串就是一个词，
+    尾巴是「なっていや」时永远判 False，这个坑踩过）。
+    """
+    if not text:
+        return False
+    try:
+        toks = list(_janome().tokenize(text[-8:]))
+    except Exception:                               # noqa: BLE001
+        return False
+    if not toks:
+        return False
+    pos = toks[-1].part_of_speech.split(",")
+    return pos[0] in ("感動詞", "接続詞", "フィラー")
+
+
+@lru_cache(maxsize=8192)
+def _attach_penalty(prev_tail, next_head):
+    """切点右边紧跟着的是**附属語**吗？是的话该罚多少（0 = 不是附属語，可以断）。
+
+    日语一个「文節」= 自立語 + 挂在后面的附属語（助詞 / 助動詞 / 接尾辞）。在附属語
+    前面断行就是把文節切开了——用户最反感的那类毛病。实测：
+      「いかが|ですか」（です=助動詞）、「あり|まして」（まし=助動詞）、
+      「北|くん」（くん=名詞,接尾）都是这么断坏的。
+    格助詞/係助詞/連体化/準体助詞/副助詞 那一类罚最重：句子根本不可能从它开头
+    （`_NO_LINE_START_PARTICLES`）。
+    """
+    if not prev_tail or not next_head:
+        return 0.0
+    try:
+        toks = list(_janome().tokenize(prev_tail + next_head))
+    except Exception:                               # noqa: BLE001
+        return 0.0
+    cut, pos = len(prev_tail), 0
+    for i, t in enumerate(toks):
+        if pos >= cut:                              # 右边第一个 token 就是它
+            if _false_particle(toks, i):
+                return 0.0                          # 「という」被拆成的 と+いう，不是助詞
+            parts = t.part_of_speech.split(",")
+            if _is_particle_like(parts, 1):
+                return 6.0                          # 句子不可能从格助詞/係助詞开头
+            if parts[0] == "助詞":
+                return 4.0
+            if parts[0] == "助動詞" or (parts[0] == "名詞" and len(parts) > 1
+                                        and parts[1] == "接尾"):
+                return 4.0                          # 助動詞/接尾辞：文節还没说完
+            return 0.0
+        if pos + len(t.surface) > cut:
+            # 切点落在这个 token **内部**：这是"劈词"，由 _cut_inside_word 负责罚，
+            # 这里不能拿后面那个词来判断（实测会误报成"下一行从助詞开头"）。
+            return 0.0
+        pos += len(t.surface)
+    return 0.0
+
+
+@lru_cache(maxsize=8192)
+def _cut_inside_word(prev_tail, next_head):
+    """这个切点是不是切在"一个词"的内部（把两边拼起来分词，看有没有 token 跨过切点）。
+
+    比"两截拼起来是不是一个词"更通用：`ゲーム機と考|えて` 这种也抓得到
+    （Janome 会把 `考えて` 分成一个 token，跨过切点）。
+    """
+    if not prev_tail or not next_head:
+        return False
+    joined = prev_tail + next_head
+    cut = len(prev_tail)
+    try:
+        toks = list(_janome().tokenize(joined))
+    except Exception:                               # noqa: BLE001
+        return False
+    pos = 0
+    for t in toks:
+        end = pos + len(t.surface)
+        if pos < cut < end:
+            return True
+        pos = end
+    return False
+
+
+def _cut_penalty(prev_text, next_text, strength, free):
+    """在"这一行结束/下一行开始"之间断开的代价（越小越该断在这儿）。
+
+    注意停顿是**负代价（奖励）**：不然动态规划会"能不断就不断"，把好几句话并成一行。
+    free=True 表示这个切点前面根本没有上一行（整集第一行），不用判代价。
+
+    权重的相对大小是有意的（实测调过）：
+      * 「切在一个词内部」+30 是**压倒性**的——宁可这行宽一点，也不能把 スポーツ 切成
+        「ス」「ポーツ」（用户最容易一眼看出来的毛病）。
+      * 「行尾是いや/でも/あの」+6、「下一行从格助詞开头」+6：这两条是**语法硬规则**，
+        必须大过停顿奖励（-1.5），否则动态规划为了吃停顿奖励照样把「いや」甩在行尾
+        （实测就是它把「…かなっていや」断在「いや」后面）。
+    """
+    if free:
+        return 0.0
+    if strength >= PAUSE_STRONG:
+        cost = -1.5                         # 强换气 → 就该在这儿断
+    elif strength >= PAUSE_CAND:
+        cost = -0.5                         # 弱换气 → 可以断
+    else:
+        cost = 1.0                          # 没有换气 → 尽量别断
+    if prev_text and next_text:
+        if _cut_inside_word(prev_text[-6:], next_text[:8]):
+            cost += 30.0                    # 切在词内部 → 基本禁止
+        if _ends_with_sentence_starter(prev_text):
+            cost += 6.0                     # 感動詞/接続詞 只会起句，不该留在行尾
+        cost += _attach_penalty(prev_text[-6:], next_text[:10])
+        # 下一行从附属語（助詞/助動詞/接尾）开头 → 把一个文節切开了
+    if not _looks_like_line_end(prev_text):
+        cost += 0.5                         # 行尾不像句末（弱惩罚）
+    return cost
+
+
+def _flatten_words(segments):
+    """把 whisper 的段+词摊平成一个按时间排序的词序列（没有词级时间就整段当一个词）。"""
+    words = []
+    for seg in segments:
+        s, e, text = seg[0], seg[1], seg[2]
+        ws = seg[3] if len(seg) > 3 else None
+        if ws:
+            for a, b, w in ws:
+                if b < a:
+                    a, b = b, a
+                words.append((float(a), max(float(b), float(a) + 0.05), w))
+        elif text:
+            words.append((float(s), max(float(e), float(s) + 0.05), text))
+    words.sort(key=lambda x: x[0])
+    return words
+
+
+def _seg_words(seg):
+    """取出这一段里的词（没有词级时间就拿整段当一个词）。"""
+    ws = seg[3] if len(seg) > 3 else None
+    if ws:
+        return [(float(a), max(float(b), float(a) + 0.05), w) for a, b, w in ws]
+    s, e, t = float(seg[0]), float(seg[1]), seg[2]
+    return [(s, max(e, s + 0.05), t)]
+
+
+def _nearest_pause(t, pauses, tol):
+    """离 t 最近的那条停顿（t 落在停顿区间里就算 0 距离）；超过 tol 就当没有。"""
+    best, hit = tol, None
+    for pa, pb, gap in pauses:
+        d = 0.0 if pa <= t <= pb else min(abs(t - pa), abs(t - pb))
+        if d <= best:
+            best, hit = d, (pa, pb, gap)
+    return hit
+
+
+def _segment_ranges(segments, spans, pauses, tol=SNAP_TOL):
+    """算出 whisper 每个"段"真实的起止时间（返回 [(start, end), ...]）。
+
+    为什么按**段**来对齐（而不是按词）：
+      * whisper 的"句子切分"是可信的——实测它把「何かの友達を作ろうとして」/「俺は自分自身の
+        問題に気づいてしまった」/「タ君ですよね」正好切开，用户要的断点就在这些地方；
+      * 不可信的只是它的**时间**：段边界平均离真停顿 0.21s（80% 在 0.3s 内、98% 在 0.6s 内），
+        而段首词的时间会被拉到段边界上（实测「俺」差 0.5s、「タ」差 4.2s——照词级时间对齐，
+        "该断的地方"就变成了"词中间"，用户实测一眼就看出来了）。
+    做法：把段边界吸附到最近的 VAD 停顿上——停顿的**起点**就是上一句的结束、**终点**就是
+    这一句的开始；连说话中间没停（附近没有停顿）就保持原样。
+    """
+    n = len(segments)
+    if not n:
+        return []
+    starts = [float(segments[0][0])] + [0.0] * (n - 1)
+    ends = [0.0] * (n - 1) + [float(segments[-1][1])]
+    if spans and abs(starts[0] - spans[0][0]) <= tol:
+        starts[0] = spans[0][0]
+    if spans and abs(ends[-1] - spans[-1][1]) <= tol:
+        ends[-1] = spans[-1][1]
+    for i in range(n - 1):
+        b = (float(segments[i][1]) + float(segments[i + 1][0])) / 2.0
+        hit = _nearest_pause(b, pauses, tol)
+        if hit:
+            ends[i], starts[i + 1] = hit[0], hit[1]
+        else:
+            ends[i] = starts[i + 1] = b
+    # 收尾：吸附可能把两条边界吸到同一条停顿上，中间那段就被挤成 0 长度甚至倒过来。
+    # 这里统一保证"起点不回退、结束不早于开始"（实测不夹的话产物里会出现负时长的行）。
+    prev_end = None
+    for i in range(n):
+        s = starts[i] if prev_end is None else max(starts[i], prev_end)
+        e = max(ends[i], s)
+        starts[i], ends[i], prev_end = s, e, e
+    return list(zip(starts, ends))
+
+
+def _retime_words(segments, spans, pauses):
+    """把 whisper 的段/词贴回**真实音频时间轴**，返回 (新词序列, {切点下标: 停顿长度})。
+
+    段的起止时间见 `_segment_ranges`（边界吸附到 VAD 停顿上）；段内的词再按原时长比例
+    铺开。⚠ 拉伸比例夹在 0.75~1.6 之间：段里混音乐/长静音时不许把一句 16 个字显示成 8 秒。
+    """
+    if not segments:
+        return [], {}
+    words = _flatten_words(segments)
+    if not words:
+        return [], {}
+    if not spans:
+        cuts = {k: words[k][0] - words[k - 1][1] for k in range(1, len(words))
+                if words[k][0] - words[k - 1][1] >= PAUSE_CAND}
+        return words, cuts
+
+    out, cuts = [], {}
+    prev_end = None
+    for i, (seg, (s0, e0)) in enumerate(zip(segments, _segment_ranges(segments, spans, pauses))):
+        group = _seg_words(seg)
+        s = s0 if prev_end is None else max(s0, prev_end)   # 时间不许倒流
+        total = sum(b - a for a, b, _ in group) or 1.0
+        scale = min(1.6, max(0.75, max(0.05, e0 - s0) / total))
+        idx0 = len(out)
+        t = s
+        for a, b, w in group:
+            d = scale * max(0.05, b - a)
+            out.append((t, t + d, w))
+            t += d
+        if i and s0 > prev_end:
+            cuts[idx0] = s0 - prev_end                     # 段与段之间的真停顿
+        if i and idx0 not in cuts:
+            # 吸附有时会把两条边界吸到同一条停顿上（中间那段被挤成 0 长度），几何差就
+            # 算不出停顿了；直接查那条停顿本身，别丢掉这个切点。
+            hit = _nearest_pause((float(segments[i - 1][1]) + float(segments[i][0])) / 2.0,
+                                 pauses, SNAP_TOL)
+            if hit and hit[2] > 0:
+                cuts[idx0] = hit[2]
+        # 段内还有停顿的（模型把好几句话并成了一段）：那些词缝也当停顿候选，这样"放不下
+        # 必须拆行"时会优先拆在换气处。但只有这一段的词时长 >= INNER_PAUSE_MIN 才这么做——
+        # 短段本来就是一句话，硬拆会变成「俺は」+「自分」这种碎片（实测踩到）。
+        # 每条停顿只认**离它中心最近的那一个**词缝，否则重铺后有几个缝都落在停顿里，
+        # 会被切好几刀。
+        for pa, pb, gap in pauses if total >= INNER_PAUSE_MIN else ():
+            best, arg = 1e9, None
+            for k in range(max(idx0 + 1, 1), len(out)):
+                t = out[k][0]
+                if not (pa - 0.05 <= t <= pb + 0.05):
+                    continue
+                d = abs(t - (pa + pb) / 2.0)
+                if d < best:
+                    best, arg = d, k
+            if arg is not None:
+                cuts.setdefault(arg, gap)
+        prev_end = t
+    return out, cuts
+
+
+def segment_lines(segments, spans, pauses, width=None, height=None, main_px=None):
+    """日语自己断句：把 whisper 词序列切成"一行一句"，返回 [(start, end, text)]。
+
+    断行候选 = whisper 自己的**段边界**（= 模型认为的句界，落在哪条词缝上由 `_retime_words`
+    给出来，缝的宽度就是音频实测的停顿）+ 段内所有词缝（代价高，只在放不下时才用）；
+    用动态规划一次选一组切点，目标：
+      * 每行都放得下（宽度 <= 画面 80%，按真实字宽算，保证注音层单行）
+      * 行尾尽量落在强停顿（换气）上
+      * 不把一个词切开 / 下一行不从助詞开头 / 感動詞不留在行尾
+    显示时间用**语音段**做骨架：语音起点（提前 LEAD_IN）即出现，这句话说完就消失
+    （HOLD_AFTER = 0，用户 2026-09 定的：不停留）；MIN_SHOW 是下限，免得一闪而过看不清，
+    而且不超过下一句的开始。
+    """
+    words = _flatten_words(segments)
+    if not words:
+        return []
+    if not main_px:
+        main_px = max(20, int(round((height or 1080) * (60 / 1080.0))))
+    limit = max(1.0, (width or 1920) * LINE_WIDTH_RATIO)
+
+    # whisper 的词级时间不可靠（段首词会被拉到段边界上、段自身的起止还把静音算进去），
+    # 用 VAD 语音段把每个"段"贴回真实音频时间轴：段内按原时长比例重铺，段与段之间就是真停顿。
+    # 没有 VAD 数据时 _retime_words 会退回用 whisper 自己的词间间隔（不够准，但比没有强）。
+    words, strength = _retime_words(segments, spans, pauses)
+
+    n = len(words)
+    texts = [w[2] for w in words]
+    # 前缀宽度：width(i, j) = pref[j] - pref[i]（O(1)，不用每次拼字符串再量）
+    pref = [0.0] * (n + 1)
+    for k, t in enumerate(texts):
+        pref[k + 1] = pref[k] + _line_width(t, main_px)
+    INF = float("inf")
+    dp = [INF] * (n + 1)
+    back = [0] * (n + 1)
+    dp[0] = 0.0
+    for j in range(1, n + 1):
+        for i in range(j - 1, -1, -1):
+            if dp[i] == INF:
+                continue
+            width_px = pref[j] - pref[i]
+            if width_px > limit and i < j - 1:
+                break                       # 再往前加词只会更宽；单个词超宽只能放行
+            if words[j - 1][1] - words[i][0] > 12.0:
+                break                       # 一行不超过 12 秒
+            text = "".join(texts[i:j])
+            cost = dp[i] + _cut_penalty("".join(texts[max(0, i - 12):i]), text,
+                                        strength.get(i, 0.0), i == 0)
+            if i > 0 and _bad_line_start(text):
+                cost += 4.0     # 下一行从格助詞/副助詞开头 → 句子不能这么起（要压过停顿奖励）
+            dur = words[j - 1][1] - words[i][0]
+            if dur < 0.4:
+                cost += 2.0                 # 一两个词的"闪一下"：宁可丢掉停顿奖励也别留
+            elif dur < 0.7:
+                cost += 0.5
+            elif dur > 8.0:
+                cost += 0.5 * (dur - 8.0)   # 一行太长读不完（12 秒是硬上限）
+            if cost < dp[j]:
+                dp[j], back[j] = cost, i
+
+    # 回溯出每行的词区间
+    cuts = []
+    j = n
+    while j > 0:
+        i = back[j]
+        cuts.append((i, j))
+        j = i
+    cuts.reverse()
+    if not cuts:
+        return []
+
+    entries = []
+    for i, j in cuts:
+        # 时间直接用**重铺后的词时间**：同一个语音段里可能切出两行，两行各用自己第一个
+        # 词的起点。以前统一取"语音段起点"，同段两行会拿到同一个开始时间，前一行被压成
+        # 0 秒甚至负数（实测 11 处 "结束<=开始"）。
+        start = max(0.0, words[i][0] - LEAD_IN)
+        end = max(start + MIN_SHOW, words[j - 1][1] + HOLD_AFTER)
+        entries.append([start, end, "".join(texts[i:j]).strip()])
+    for k in range(len(entries) - 1):            # 下一句来了就切，两行之间留 0.05s 缝
+        nxt = entries[k + 1][0]
+        entries[k][1] = min(entries[k][1], nxt - 0.05)
+        entries[k][1] = max(entries[k][1], min(entries[k][0] + MIN_SHOW, nxt - 0.05))
+    entries[-1][1] = max(entries[-1][1], entries[-1][0] + MIN_SHOW)
+    return [(s, e, t) for s, e, t in entries if t]
+
+
+def transcribe(wav_path, timeline, max_end, video=None, main_px=None, mode="jp"):
     """faster-whisper large-v3 听写，返回对齐好的 [(start, end, text), ...]。
 
     word_timestamps=True：只有拿到词级时间，才能把 Whisper"两句并一段"的输出
@@ -556,6 +1013,10 @@ def transcribe(wav_path, timeline, max_end):
     ⚠ CUDA 起不来（缺 cublas/cudnn DLL）时**自动改用 CPU 重跑**：以前只在加载前
     `get_cuda_device_count()` 判断，装了显卡驱动但没装 CUDA 运行库的机器会通过这个检查、
     然后在推理时炸掉（clean 环境实测）。
+
+    断句两种模式（config.ini 的 [align] mode，默认 jp）：
+      jp  日语自己断句：VAD 停顿 + DP（单行宽度）+ 语音时间骨架（用户只看日语轨）
+      cn  老路径：按中文字幕轨的断句边界切（保留，可一键切回）
     """
     device, compute_type = pick_device()
     if device == "cpu":
@@ -575,8 +1036,20 @@ def transcribe(wav_path, timeline, max_end):
                 continue
             raise
 
-    # 按中文断句边界切分词级时间轴
-    seg_list = align_timeline(seg_list, timeline, max_end, total_dur)
+    if mode == "cn":
+        # 老路径：按中文字幕的断句边界切（config.ini 里 [align] mode = cn 可以切回来）
+        seg_list = align_timeline(seg_list, timeline, max_end, total_dur)
+    else:
+        # 新路径：日语自己断句——VAD 停顿当换气点，DP 按单行宽度拼行，时间跟语音走
+        spans, pauses = detect_pauses(wav_path)
+        if spans:
+            print(f"  [断句] VAD: 语音 {len(spans)} 段 / 停顿 {len(pauses)} 处", flush=True)
+        else:
+            print("  [断句] 拿不到 VAD 停顿，退回用 whisper 词间间隔", flush=True)
+        seg_list = segment_lines(seg_list, spans, pauses,
+                                 width=video[0] if video else None,
+                                 height=video[1] if video else None,
+                                 main_px=main_px)
     return seg_list, total_dur, qa_stats(seg_list, total_dur)
 
 
@@ -881,19 +1354,22 @@ def _run(keep_srt, use_furigana, target, auto_download_tools=False):
             extract_wav(mkv, audio, wav_path)
             print("  audio track -> wav ok")
 
-            seg_list, dur, qa = transcribe(wav_path, timeline, max_end)
+            # 视频尺寸/字号先拿好：日语侧断句要按"单行宽度"限制来拼行
+            vw, vh = video_size(mkv)
+            folder = Path(mkv).parent
+            opt_main = cfg_int("furigana", "main_px", folder)
+            align_mode = (common.setting("align", "mode", "jp", folder) or "jp").lower()
+            seg_list, dur, qa = transcribe(wav_path, timeline, max_end,
+                                           (vw, vh), opt_main, align_mode)
             print(f"  whisper done, duration={dur:.1f}s, 日语 {qa['n']} 条, "
                   f"覆盖 {qa['covered']:.0f}s/{qa['total']:.0f}s, "
                   f"语速>10字/s {qa['cram']} 条")
 
             # 字幕文件：默认生成带平假名注音的 ASS；--no-furigana 或注音模块不可用时退回 SRT
             if use_furigana and HAVE_FURIGANA:
-                vw, vh = video_size(mkv)
-                folder = Path(mkv).parent
                 dict_path = find_dict(folder)
                 # 配置分层：[furigana] 段可以覆盖默认字号/底边距/每行上限
                 # （番剧文件夹里的 config.ini 优先于脚本同目录的全局 config.ini）
-                opt_main = cfg_int("furigana", "main_px", folder)
                 opt_bottom = cfg_int("furigana", "bottom_px", folder)
                 opt_chars = cfg_int("furigana", "max_chars", folder)
                 ass, ms, rs = furigana.build_ass(
