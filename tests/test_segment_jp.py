@@ -72,6 +72,51 @@ class TestNearestPause(unittest.TestCase):
         self.assertEqual(ajs._nearest_pause(5.1, pauses, 0.6), (5.0, 5.3, 0.3))
 
 
+class TestFalseParticle(unittest.TestCase):
+    """碎片上下文里 Janome 会把「はい」「でも」拆成 は+いい / で+も，别当成"助詞起句"。"""
+
+    def test_known_false_positives_are_not_penalised(self):
+        # 实测：这 20 处误报就是用户说的"开头词被并进上一句"
+        self.assertEqual(ajs._attach_penalty("たそこまでは", "でもちゃんと技術力の"), 0.0)
+        self.assertEqual(ajs._attach_penalty("私は無敵だ", "じゃあ今度はなりかから"), 0.0)
+        self.assertEqual(ajs._attach_penalty("優しいという", "ねえねえ困ったより"), 0.0)
+
+    def test_real_case_particles_still_penalised(self):
+        # 真·格助詞/係助詞 开头还是要拦（不能改坏）
+        for a, b in (("ですか", "がはい"), ("それ", "はいいですか"),
+                     ("どこ", "にいますか"), ("これ", "をください")):
+            self.assertEqual(ajs._attach_penalty(a, b), 6.0)
+
+
+class TestBoundaryRepair(unittest.TestCase):
+    """whisper 的段边界修到语言上合法的位置（用户实测的三类毛病）。"""
+
+    def test_mid_word_shift_moves_to_word_start(self):
+        prev = "ありがとうございます北くんは将"          # whisper 把「将来」切成 将｜来
+        self.assertEqual(ajs._mid_word_shift(prev, "来どんな社長になりたいとかって"), len(prev) - 1)
+        # 干净的边界不动（用真实数据里的两段）
+        self.assertEqual(ajs._mid_word_shift("お渡ししましたよね", "ああはい例えばこちらの方と"), 0)
+
+    def test_trailing_starter_moves_to_next_line(self):
+        # 实测：whisper 把下一句开头的「え」「はい」留在上一段末尾
+        self.assertEqual(ajs._trailing_starter_start("たどり着いてくれましたえ"), 11)
+        self.assertEqual(ajs._trailing_starter_start("よくわかりましたはい"), 8)
+        # 整段就是起句词 → 不动（它本来就是独立的一句）
+        self.assertEqual(ajs._trailing_starter_start("え"), 0)
+        self.assertEqual(ajs._trailing_starter_start("なるほど"), 0)
+        # ⚠ 尾巴上的「う」是「思う」的尾巴，不是感動詞（拿 whisper 的碎片词判会踩这个坑）
+        self.assertEqual(ajs._trailing_starter_start("しかし楽しめるように体を鍛えて損はないと思う"), 0)
+
+    def test_leading_attach_moves_back_into_previous_line(self):
+        self.assertEqual(ajs._leading_attach_len("のよし2人ともいいぞ"), 1)
+        self.assertEqual(ajs._leading_attach_len("だよな何とかして"), 1)
+        self.assertEqual(ajs._leading_attach_len("だったって今はもういいの"), 3)
+        # 这些虽然 Janome 说是助詞，但其实是整词的开头 / 独立一句 → 不动
+        self.assertEqual(ajs._leading_attach_len("はい"), 0)
+        self.assertEqual(ajs._leading_attach_len("だが子供の頃"), 0)
+        self.assertEqual(ajs._leading_attach_len("なあ成香競技大会"), 0)
+
+
 class TestSegmentRanges(unittest.TestCase):
     """whisper 的段边界 → 吸附到真停顿上，得到每段的真实起止。"""
 
@@ -120,7 +165,7 @@ class TestSegmentRanges(unittest.TestCase):
 class TestRetimeWords(unittest.TestCase):
     def test_words_are_laid_out_on_the_snapped_range(self):
         segs = [(0.0, 1.0, "x", [(0.0, 0.5, "あ"), (0.5, 1.0, "い")])]
-        out, _cuts = ajs._retime_words(segs, [(0.0, 1.0)], [])
+        out, _cuts, _trusted = ajs._retime_words(segs, [(0.0, 1.0)], [])
         self.assertEqual([w[2] for w in out], ["あ", "い"])
         self.assertAlmostEqual(out[0][0], 0.0, places=6)
         self.assertAlmostEqual(out[-1][1], 1.0, places=6)
@@ -128,7 +173,7 @@ class TestRetimeWords(unittest.TestCase):
     def test_cut_is_put_on_the_pause(self):
         segs = [(0.0, 0.5, "x", [(0.0, 0.5, "あ")]),
                 (1.02, 1.5, "y", [(1.02, 1.5, "い")])]
-        out, cuts = ajs._retime_words(segs, [(0.0, 0.5), (1.0, 1.5)], [(0.5, 1.0, 0.5)])
+        out, cuts, _trusted = ajs._retime_words(segs, [(0.0, 0.5), (1.0, 1.5)], [(0.5, 1.0, 0.5)])
         self.assertEqual(len(out), 2)
         self.assertAlmostEqual(cuts[1], 0.5, places=6)       # 缝 = 真停顿长度
         self.assertAlmostEqual(out[1][0], 1.0, places=6)     # 贴回音频时间
@@ -136,7 +181,7 @@ class TestRetimeWords(unittest.TestCase):
     def test_no_stretch_beyond_limit(self):
         """段里混了音乐/长静音时不许把词无限拉长（实测最夸张差 8 倍）。"""
         segs = [(0.0, 1.0, "x", [(0.0, 0.5, "あ"), (0.5, 1.0, "い")])]
-        out, _cuts = ajs._retime_words(segs, [(0.0, 100.0)], [])
+        out, _cuts, _trusted = ajs._retime_words(segs, [(0.0, 100.0)], [])
         self.assertLessEqual(out[-1][1] - out[0][0], 1.0 * 1.6 + 1e-6)
 
     def test_short_segment_does_not_split_on_its_inner_pause(self):
@@ -147,9 +192,38 @@ class TestRetimeWords(unittest.TestCase):
         ws = [(9.57, 10.07, "俺"), (10.07, 10.29, "は"), (10.29, 10.65, "自分"),
               (10.65, 12.0, "自身の問題に気づいてしまった")]
         segs = [(9.5, 13.2, "x", ws)]
-        _out, cuts = ajs._retime_words(segs, [(9.57, 10.02), (11.04, 13.25)],
-                                       [(10.02, 11.04, 1.02)])
+        _out, cuts, _trusted = ajs._retime_words(segs, [(9.57, 10.02), (11.04, 13.25)],
+                                                 [(10.02, 11.04, 1.02)])
         self.assertEqual(cuts, {})
+
+    def test_mid_word_boundary_is_registered_at_the_word_start(self):
+        """whisper 把「将来」切成 将｜来 → 注册的切点要挪到"将"之前（整词归下一句）。"""
+        segs = [(0.0, 1.0, "北くんは将", [(0.0, 0.5, "北くん"), (0.5, 1.0, "は将")]),
+                (1.5, 2.5, "来どんな社長に", [(1.5, 2.5, "来どんな社長に")])]
+        _out, cuts, trusted = ajs._retime_words(segs, [(0.0, 1.0), (1.5, 2.5)],
+                                                [(1.0, 1.5, 0.5)])
+        self.assertIn(1, cuts)          # 「は将」之前（= 不把 将来 劈开）
+        self.assertNotIn(2, cuts)       # 不是原来那个段首（= 「来」之前）
+        self.assertIn(1, trusted)
+
+    def test_trailing_starter_boundary_is_registered_before_it(self):
+        """上一段末尾的「え」其实是下一句的开头 → 切点要挪到「え」之前。"""
+        segs = [(0.0, 1.0, "くれましたえ", [(0.0, 0.6, "くれました"), (0.6, 1.0, "え")]),
+                (1.5, 2.5, "今までのお世話係", [(1.5, 2.5, "今までのお世話係")])]
+        _out, cuts, trusted = ajs._retime_words(segs, [(0.0, 1.0), (1.5, 2.5)],
+                                                [(1.0, 1.5, 0.5)])
+        self.assertIn(1, cuts)          # 「え」之前
+        self.assertIn(1, trusted)
+
+    def test_trusted_boundary_gets_at_least_a_weak_pause(self):
+        """whisper 标了句界、但音频里只有一丁点换气 → 也要按"弱停顿"算，
+        否则动态规划宁愿把下一句的开头并进上一行（用户实测抱怨的那种）。"""
+        segs = [(0.0, 1.0, "そうですね", [(0.0, 1.0, "そうですね")]),
+                (1.05, 2.0, "前にクラスメイトの", [(1.05, 2.0, "前にクラスメイトの")])]
+        _out, cuts, _trusted = ajs._retime_words(segs, [(0.0, 1.0), (1.05, 2.0)],
+                                                 [(1.0, 1.05, 0.05)])
+        self.assertIn(1, cuts)
+        self.assertGreaterEqual(cuts[1], ajs.PAUSE_CAND)
 
 
 class TestSegmentLines(unittest.TestCase):
@@ -230,6 +304,21 @@ class TestSegmentLines(unittest.TestCase):
         segs = [(0.0, 0.2, "x", [(0.0, 0.2, "あ")])]
         _s, e, _t = self._lines(segs, [(0.0, 0.2)], [])[0]
         self.assertGreaterEqual(e, 0.6 - 1e-6)       # 写死 0.6：拿常量比会"改坏也测不出来"
+
+    def test_segment_boundary_is_trusted(self):
+        """whisper 标的句界要真的断开，哪怕下一段开头在碎片里被 Janome 看成助詞。
+
+        实测「…いかがですか俺が｜はいいつきさんが」（其实是「はい、いつきさんが」）：
+        旧代码因为碎片里 `はいいつき` 被切成 は+いい+つき，判成"下一行以係助詞开头"→ 整段并进
+        上一行。用户看到的就是"开头词被切到上一句里面了"。
+        """
+        segs = [(0.0, 1.0, "x", [(0.0, 0.4, "ですか"), (0.4, 1.0, "俺が")]),
+                (1.4, 2.4, "y", [(1.4, 2.4, "はいいつきさんが")])]
+        lines = self._lines(segs, [(0.0, 1.0), (1.4, 2.4)], [(1.0, 1.4, 0.4)])
+        texts = [t for _s, _e, t in lines]
+        self.assertIn("はいいつきさんが", texts)      # 下一句自己成行
+        self.assertFalse([t for t in texts if t.endswith("俺が") is False and "はいいつき" in t
+                          and "俺" in t])
 
 
 if __name__ == "__main__":
