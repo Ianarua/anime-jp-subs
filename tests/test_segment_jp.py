@@ -193,45 +193,78 @@ class TestRetimeWords(unittest.TestCase):
         self.assertLessEqual(out[-1][1] - out[0][0], 1.0 * 1.6 + 1e-6)
 
     def test_short_segment_does_not_split_on_its_inner_pause(self):
-        """段本身还是一句话（词时长不够长）时，段内停顿不当切点。
+        """1.02s 的停顿**确实**落在「は|自分」这个词缝上（改版后切点候选来自音频）。
 
-        实测踩过：不拦的话「俺は自分自身の問題に…」会被切成「俺は」「自分」「自身の…」。
+        ⚠ 2026-09 改版：以前切点候选是"whisper 的段界 + 条件注册的段内停顿"，短段内部的
+        停顿干脆不算候选；现在切点候选 = 词与词之间的**真实停顿**（词整块落在语音片上），
+        所以这里会注册候选。**能不能断**由拼行的代价决定（「行尾是格助詞」+1.5 会拦住它），
+        见 TestSegmentLines.test_auxiliary_is_not_separated_from_its_head。
         """
         ws = [(9.57, 10.07, "俺"), (10.07, 10.29, "は"), (10.29, 10.65, "自分"),
               (10.65, 12.0, "自身の問題に気づいてしまった")]
         segs = [(9.5, 13.2, "x", ws)]
         _out, cuts, _trusted = ajs._retime_words(segs, [(9.57, 10.02), (11.04, 13.25)],
                                                  [(10.02, 11.04, 1.02)])
-        self.assertEqual(cuts, {})
+        # 词整块落在语音片上 → 1.02s 的停顿落在**词缝**上（这里落在「俺|は」之间）；
+        # 具体落在哪个缝由分组 DP 决定，测试只钉住"缝宽 = 音频实测的停顿"。
+        self.assertEqual(list(cuts), [1])
+        self.assertAlmostEqual(cuts[1], 1.02, places=2)
 
-    def test_mid_word_boundary_is_registered_at_the_word_start(self):
-        """whisper 把「将来」切成 将｜来 → 注册的切点要挪到"将"之前（整词归下一句）。"""
-        segs = [(0.0, 1.0, "北くんは将", [(0.0, 0.5, "北くん"), (0.5, 1.0, "は将")]),
-                (1.5, 2.5, "来どんな社長に", [(1.5, 2.5, "来どんな社長に")])]
-        _out, cuts, trusted = ajs._retime_words(segs, [(0.0, 1.0), (1.5, 2.5)],
+    def test_cut_candidates_are_exactly_the_real_gaps(self):
+        """切点候选 = 重铺后**词与词之间的真实间隔**（≥ PAUSE_CAND），不多不少。
+
+        ⚠ 2026-09 改版：以前切点按 whisper 的段界注册（段界在哪儿就在哪儿切），用户
+        80 条标记里有 23 处判定"断在句子中间"——段界处根本没有停顿，停顿在别的词缝上。
+        """
+        segs = [(0.0, 1.0, "あい", [(0.0, 0.5, "あ"), (0.5, 1.0, "い")]),
+                (1.5, 2.5, "うえ", [(1.5, 2.0, "う"), (2.0, 2.5, "え")])]
+        out, cuts, _trusted = ajs._retime_words(segs, [(0.0, 1.0), (1.5, 2.5)],
                                                 [(1.0, 1.5, 0.5)])
-        self.assertIn(1, cuts)          # 「は将」之前（= 不把 将来 劈开）
-        self.assertNotIn(2, cuts)       # 不是原来那个段首（= 「来」之前）
-        self.assertIn(1, trusted)
+        for k, gap in cuts.items():
+            self.assertGreaterEqual(gap, ajs.PAUSE_CAND)
+            self.assertAlmostEqual(out[k][0] - out[k - 1][1], gap, places=2)
+        self.assertEqual(sorted(cuts), [2])       # 只有段与段之间那个 0.5s
 
-    def test_trailing_starter_boundary_is_registered_before_it(self):
-        """上一段末尾的「え」其实是下一句的开头 → 切点要挪到「え」之前。"""
-        segs = [(0.0, 1.0, "くれましたえ", [(0.0, 0.6, "くれました"), (0.6, 1.0, "え")]),
-                (1.5, 2.5, "今までのお世話係", [(1.5, 2.5, "今までのお世話係")])]
-        _out, cuts, trusted = ajs._retime_words(segs, [(0.0, 1.0), (1.5, 2.5)],
-                                                [(1.0, 1.5, 0.5)])
-        self.assertIn(1, cuts)          # 「え」之前
-        self.assertIn(1, trusted)
+    def test_no_word_spans_any_pause(self):
+        """任何一个词都不许横跨停顿——停顿必须落在词与词之间。
 
-    def test_trusted_boundary_gets_at_least_a_weak_pause(self):
-        """whisper 标了句界、但音频里只有一丁点换气 → 也要按"弱停顿"算，
-        否则动态规划宁愿把下一句的开头并进上一行（用户实测抱怨的那种）。"""
-        segs = [(0.0, 1.0, "そうですね", [(0.0, 1.0, "そうですね")]),
-                (1.05, 2.0, "前にクラスメイトの", [(1.05, 2.0, "前にクラスメイトの")])]
-        _out, cuts, _trusted = ajs._retime_words(segs, [(0.0, 1.0), (1.05, 2.0)],
-                                                 [(1.0, 1.05, 0.05)])
-        self.assertIn(1, cuts)
-        self.assertGreaterEqual(cuts[1], ajs.PAUSE_CAND)
+        实测（不是哥们 E11，2026-09 用户标记）：老做法把词按时长比例摊开，0.67s 停顿正好
+        落在「それは」**这个词内部**，于是用户想要的断点（…テーブルね|それは私が…）
+        在词表里根本不存在，怎么都断不开；反过来「ハルキ」这种词缝上又冒出假切点。
+        """
+        segs = [(19.0, 22.8, "窓際のテーブルねそれは私が持っていくから",
+                 [(19.0, 19.6, "窓際"), (19.6, 20.2, "の"), (20.2, 20.5, "テーブル"),
+                  (20.5, 20.7, "ね"), (20.7, 21.3, "それは"), (21.3, 21.7, "私"),
+                  (21.7, 22.0, "が"), (22.0, 22.4, "持って"), (22.4, 22.8, "いくから")])]
+        spans = [(19.33, 20.67), (21.34, 22.69)]
+        pauses = [(20.67, 21.34, 0.67)]
+        out, cuts, _trusted = ajs._retime_words(segs, spans, pauses)
+        for a, b, w in out:
+            for pa, pb, _g in pauses:
+                self.assertFalse(a < pa and b > pb, f"{w} 横跨了停顿：{a}-{b}")
+        self.assertIn(4, cuts)                    # 「ね|それは」——用户要的断点
+        self.assertAlmostEqual(cuts[4], 0.67, places=2)
+
+    def test_no_word_spans_a_long_silence(self):
+        """一个词不许横跨长静音（≥ INNER_PAUSE_STRONG）。
+
+        实测（不是哥们 E11，2026-09）：whisper 把隔了 31.5 秒静音的「何が」(1091s) 和
+        「あった」(1126s) 并成一段（4 个词），重铺时「が」被铺成 **34.05 秒**、横跨整段静音。
+        它接着让"一行不超过 12 秒"的守卫把整集判成无解 → 整集只剩 1 条字幕。
+        """
+        segs = [(1091.32, 1126.42, "何があった",
+                 [(1091.32, 1092.02, "何"), (1092.53, 1094.73, "が"),
+                  (1126.18, 1126.30, "あ"), (1126.30, 1126.42, "った")])]
+        spans = [(1091.68, 1092.54), (1092.86, 1093.06), (1093.44, 1094.50), (1126.05, 1126.42)]
+        pauses = [(1092.544, 1092.864, 0.32), (1093.056, 1093.44, 0.384),
+                  (1094.496, 1126.048, 31.552)]
+        words, _cuts, _trusted = ajs._retime_words(segs, spans, pauses)
+        self.assertEqual([w for _a, _b, w in words], ["何", "が", "あ", "った"])
+        for a, b, w in words:
+            self.assertFalse(a < 1094.496 and b > 1126.048, f"{w} 横跨了长静音：{a}-{b}")
+        # 「が」留在静音**前**那片语音里（夹到语音末尾），「あ」「った」在静音后
+        self.assertLessEqual([b for _a, b, w in words if w == "が"][0], 1094.50 + 1e-6)
+        self.assertGreaterEqual([a for a, _b, w in words if w == "あ"][0], 1126.05 - 1e-6)
 
 
 class TestSegmentLines(unittest.TestCase):
@@ -244,8 +277,10 @@ class TestSegmentLines(unittest.TestCase):
     def test_interjection_starts_the_next_line(self):
         """「…かなって」+「いやそんなことないです」：いや 不能留在上一行行尾。
 
-        ⚠ 段切分按 whisper 的真实形态来：它把「いやそんなことないです」算一段
-        （不是把 いや 单独切一段）——测试数据要和真实输入一致，否则测的是假情况。
+        ⚠ 2026-09 改版：句首的感動詞现在允许**自己成行**（用户在同集把「はい」标记成
+        要单独断开的），所以这里不再要求「いやそんなことないです」必须并成一条，
+        只要求「いや」不能粘在上一行行尾。测试数据仍按 whisper 的真实形态给
+        （它把「いやそんなことないです」算一段，不是把 いや 单独切一段）。
         """
         segs = [(0.00, 0.50, "かなって", [(0.00, 0.50, "かなって")]),
                 (1.00, 3.22, "いやそんなことないです",
@@ -254,8 +289,8 @@ class TestSegmentLines(unittest.TestCase):
         spans = [(0.0, 0.5), (1.0, 1.5), (2.0, 3.22)]
         pauses = [(0.5, 1.0, 0.5), (1.5, 2.0, 0.5)]
         texts = [t for _s, _e, t in self._lines(segs, spans, pauses)]
-        self.assertFalse([t for t in texts if t.endswith("いや")])
-        self.assertIn("いやそんなことないです", texts)
+        self.assertFalse([t for t in texts if t.endswith("いや") and t != "いや"])
+        self.assertIn("いや", texts)                 # 自己成行，且不在上一行行尾
 
     def test_word_split_across_a_pause_is_avoided(self):
         """「ス」「ポーツ」中间正好有一整段停顿，也不能断（+30 的劈词代价压过停顿奖励）。
@@ -307,6 +342,21 @@ class TestSegmentLines(unittest.TestCase):
             self.assertLessEqual(ajs._line_width(t, self.MAIN),
                                  self.W * ajs.LINE_WIDTH_RATIO + 1e-6)
 
+    def test_one_long_word_does_not_kill_the_whole_dp(self):
+        """单个词特别长时，守卫必须放行——否则整条 DP 无解、整集塌成 1 行。
+
+        实测（不是哥们 E11，2026-09）：整集 2749 个词只切出 1 行，原因就是这里
+        `break` 掉了一个横跨 34 秒的单词。行宽那条守卫早就有 `i < j - 1`，时间这条漏了。
+        """
+        segs = [(0.0, 13.0, "x", [(0.0, 13.0, "ああああああああああ")]),
+                (13.4, 14.0, "y", [(13.4, 14.0, "いいいい")]),
+                (14.4, 15.0, "z", [(14.4, 15.0, "うううう")])]
+        lines = self._lines(segs, [(0.0, 13.0), (13.4, 14.0), (14.4, 15.0)],
+                            [(13.0, 13.4, 0.4), (14.0, 14.4, 0.4)])
+        texts = [t for _s, _e, t in lines]
+        self.assertGreater(len(lines), 1)
+        self.assertIn("いいいい", texts)
+
     def test_time_never_goes_backwards(self):
         words = [(i * 0.2, i * 0.2 + 0.2, "あ") for i in range(60)]
         segs = [(0.0, 3.0, "a", words[:15]), (3.2, 6.0, "b", words[15:30]),
@@ -333,20 +383,22 @@ class TestSegmentLines(unittest.TestCase):
         _s, e, _t = self._lines(segs, [(0.0, 0.2)], [])[0]
         self.assertGreaterEqual(e, 0.6 - 1e-6)       # 写死 0.6：拿常量比会"改坏也测不出来"
 
-    def test_segment_boundary_is_trusted(self):
-        """whisper 标的句界要真的断开，哪怕下一段开头在碎片里被 Janome 看成助詞。
+    def test_segment_boundary_is_no_longer_a_hard_cut(self):
+        """whisper 的段界**不再**是无条件切点（2026-09 改，用户 80 条标记的结论）。
 
-        实测「…いかがですか俺が｜はいいつきさんが」（其实是「はい、いつきさんが」）：
-        旧代码因为碎片里 `はいいつき` 被切成 は+いい+つき，判成"下一行以係助詞开头"→ 整段并进
-        上一行。用户看到的就是"开头词被切到上一句里面了"。
+        旧行为：段界上强制断开，哪怕下一段开头在碎片里被 Janome 看成助詞
+        （实测「…いかがですか俺が｜はいいつきさんが」其实是「はい、いつきさんが」）。
+        新证据：同一集里用户把 23 处段界判成"两句其实是一句"（其中还有 2.05s / 4.00s 这种
+        长停顿），所以段界改成"只削弱碎片语法罚分、不强制断"。
+        这条用例保住的是**另一半**：段界前那个「が」不能因此把「俺が」劈出来
+        （「行尾是格助詞」+1.5 仍在），也就是这里宁可整段并成一条。
         """
         segs = [(0.0, 1.0, "x", [(0.0, 0.4, "ですか"), (0.4, 1.0, "俺が")]),
                 (1.4, 2.4, "y", [(1.4, 2.4, "はいいつきさんが")])]
         lines = self._lines(segs, [(0.0, 1.0), (1.4, 2.4)], [(1.0, 1.4, 0.4)])
         texts = [t for _s, _e, t in lines]
-        self.assertIn("はいいつきさんが", texts)      # 下一句自己成行
-        self.assertFalse([t for t in texts if t.endswith("俺が") is False and "はいいつき" in t
-                          and "俺" in t])
+        self.assertIn("ですか俺がはいいつきさんが", texts)   # 并成一条，没把「俺が」劈出去
+        self.assertNotIn("俺が", texts)                     # 也没切成「…ですか」「俺が|はいいつき…」
 
 
 if __name__ == "__main__":

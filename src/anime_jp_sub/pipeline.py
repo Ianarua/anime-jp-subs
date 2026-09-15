@@ -630,6 +630,32 @@ INNER_PAUSE_STRONG = 1.5     # 段内停顿 >= 1.5s 的**无条件**算切点：
                              # 之间的长静音（whisper 会把两句话并成一段，时间戳也不准）
 _END_PUNCT = "。！？!?…"
 
+# ===== 断句打分用的权重 =====
+# 全部是拿用户 2026-09 那份 80 条评审标记（不是哥们 E11：23 处"该并不并"、57 处
+# "该断没断"）量出来的。改动前先跑 align_work/score_marks.py 看通过率。
+W_PUNCT_END = -2.0       # 行尾是句末标点（。！？…）
+W_COMMA_END = -2.0       # 行尾是「、」——口语里也是一个换气点
+W_FINAL_PARTICLE = -0.8  # 行尾是終助詞（ね・よ・か・な・わ・かな…）
+W_PREDICATE_END = -0.6   # 行尾是助動詞/動詞/形容詞（一个谓语说完了）
+W_STARTER_HEAD = -0.5    # 行首是感動詞/フィラー（いや・あ・あの・もう・え）
+W_CONTENT_HEAD = -0.3    # 行首是实词（名詞/副詞/動詞…）——新句子一般从实词起
+W_ATTACH_END = 1.5       # 行尾是格助詞/連体化の/係助詞/接続助詞 → 文節还没说完
+W_ATTACH_HEAD = 1.5      # 行首是「という/っていう/って/みたいな/とか」→ 挂在上一句后面
+W_BLUNT = 0.5            # 两边都不像句界（原来的弱惩罚）
+W_PAUSE_STRONG = -1.5    # 强换气（>= PAUSE_STRONG）的奖励
+W_PAUSE_WEAK = -1.0      # 弱换气（>= PAUSE_CAND）的奖励
+W_NO_PAUSE = 1.0         # 一点换气都没有时"在这儿断"的代价
+SEG_BOUNDARY_DISCOUNT = 0.0    # whisper 自己标的句界上，语法罚分打几折（0 = 完全信它）。
+                               # 拿用户 80 条标记量过：1.0→40/80、0.35→44/80、0.2→48/80，
+                               # 所以句界上"碎片语法"基本不可信（但也没到无条件强制切）。
+BAD_START_PENALTY = 4.0        # 「下一行从格助詞开头」的罚分（硬规则）
+BAD_START_DISCOUNT = 1.0       # 句界上这条罚分打几折（1.0 = 不打折：实测打折会切出
+                               # 「に頼まれて…」这种行首是助詞的行，用户最反感这种）
+SHORT_LINE_A = 0.35      # 短于一行的"闪一下"下限（秒）
+PENALTY_A = 3.0          # 比它更短 → 罚这么多（1~2 个字的碎行：「日」「変」「あ、」）
+SHORT_LINE_B = 0.60      # 稍短
+PENALTY_B = 1.0          # 罚这么多
+
 
 def detect_pauses(wav_path, threshold=0.5, min_silence=PAUSE_CAND):
     """用 silero VAD（faster-whisper 自带，不用装新东西）从音频里找"换气/停顿"。
@@ -798,6 +824,124 @@ def _cut_inside_word(prev_tail, next_head):
     return False
 
 
+@lru_cache(maxsize=8192)
+def _last_token_pos(text):
+    """这一截的最后一个 token 是什么词性（品詞, 品詞細分類1）；拿不到返回 None。"""
+    if not text:
+        return None
+    try:
+        toks = list(_janome().tokenize(text[-10:]))
+    except Exception:                                   # noqa: BLE001
+        return None
+    if not toks:
+        return None
+    parts = toks[-1].part_of_speech.split(",")
+    return (parts[0], parts[1] if len(parts) > 1 else "")
+
+
+@lru_cache(maxsize=8192)
+def _first_token_pos(text):
+    """这一截的第一个 token 是什么词性。用**整句**判，碎片里 Janome 会拆错
+    （实测碎片里的「はいいつき」被切成 は+いい+つき）。"""
+    if not text:
+        return None
+    try:
+        toks = list(_janome().tokenize(text))
+    except Exception:                                   # noqa: BLE001
+        return None
+    if not toks:
+        return None
+    parts = toks[0].part_of_speech.split(",")
+    return (parts[0], parts[1] if len(parts) > 1 else "")
+
+
+_LEFT_ATTACH_HEAD = ("という", "っていう", "ていう", "って", "みたいな", "とか", "など",
+                     "っていうか", "ってば")
+_CONTENT_HEAD_POS = ("名詞", "代名詞", "副詞", "連体詞", "動詞", "形容詞", "接頭辞")
+
+
+@lru_cache(maxsize=8192)
+def _boundary_cost(prev_text, next_text):
+    """这个切点"像不像一句话的结尾/开头"（负 = 像，奖励在这儿断）。
+
+    用户 2026-09 的评审标记把两类毛病都指出来了，所以这里两边都要判：
+      * 该断没断（57 处）：很多地方**一点停顿都没有**（一句连着说），只能靠语法——
+        行尾是終助詞/句末标点、行首起新句（感動詞/实词）就该奖励；
+      * 不该断却断了（23 处）：行尾是格助詞/連体化の（「…僕の|存在を」）、行首是
+        挂在上一句后面的「という/って/みたいな」（「…後遺症|というか」）→ 该罚。
+    """
+    if not prev_text or not next_text:
+        return 0.0
+    cost = 0.0
+    looks_end = looks_head = False
+    if prev_text[-1] in _END_PUNCT:
+        cost += W_PUNCT_END
+        looks_end = True
+    elif prev_text[-1] in "、,":
+        cost += W_COMMA_END
+        looks_end = True
+    pt = _last_token_pos(prev_text)
+    if pt:
+        if pt[0] == "助詞" and pt[1] == "終助詞":
+            cost += W_FINAL_PARTICLE
+            looks_end = True
+        elif pt[0] in ("助動詞", "動詞", "形容詞"):
+            cost += W_PREDICATE_END
+            looks_end = True
+        if pt[0] == "助詞" and pt[1] in ("格助詞", "係助詞", "連体化", "準体助詞",
+                                         "接続助詞", "引用"):
+            cost += W_ATTACH_END               # 文節还没说完，句子不能停在这儿
+    nt = _first_token_pos(next_text)
+    if nt:
+        if nt[0] in ("感動詞", "フィラー"):
+            cost += W_STARTER_HEAD
+            looks_head = True
+        elif nt[0] in _CONTENT_HEAD_POS:
+            cost += W_CONTENT_HEAD
+            looks_head = True
+    # 「…後遺症|というか」「…こと|っていう」：挂在上一句后面的引用/同格，不能起句
+    if pt and pt[0] in _CONTENT_HEAD_POS and next_text.startswith(_LEFT_ATTACH_HEAD):
+        cost += W_ATTACH_HEAD
+    # 两个感動詞之间不能断：「ああはい」「うんうん」「ええと」是一个整体
+    # （实测用户 1:17 那处「ああはい」被切成「ああ」「はい」两条）
+    if pt and nt and pt[0] in ("感動詞", "フィラー") and nt[0] in ("感動詞", "フィラー"):
+        cost += 4.0
+    if not (looks_end and looks_head):
+        cost += W_BLUNT
+    return cost
+
+
+def _cut_base_cost(texts, i, strength, trusted):
+    """切点 i 的代价里**只跟这个切点有关**的部分（跟"这一行从哪儿开始"无关）。
+
+    拆出来是为了速度：原来每个 (i,j) 都要重新拼字符串 + 分词，一集 2749 个词要跑
+    几十秒（实测 segment_lines 是整个流程最慢的一步）。这里按 i 算一次就够。
+    """
+    if i <= 0:
+        return 0.0
+    prev = "".join(texts[max(0, i - 12):i])
+    head = "".join(texts[i:i + 6])                 # 下一行的开头（只判开头，够用了）
+    st = strength.get(i, 0.0)
+    if st >= PAUSE_STRONG:
+        cost = W_PAUSE_STRONG
+    elif st >= PAUSE_CAND:
+        cost = W_PAUSE_WEAK
+    else:
+        cost = W_NO_PAUSE
+    if _cut_inside_word(prev[-6:], head[:8]):
+        cost += 30.0
+    # whisper 自己标的句界 → 语法罚分打个折（碎片里 Janome 会误判，不能全信）
+    k = SEG_BOUNDARY_DISCOUNT if i in trusted else 1.0
+    if st < INNER_PAUSE_STRONG:
+        # 「下一行从附属語开头」这条**不打折**：它是文節硬规则（いかが|ですか 实测断错）
+        cost += _attach_penalty(prev[-10:], head[:16])
+        if _bad_line_start(head):
+            cost += BAD_START_PENALTY * (BAD_START_DISCOUNT if i in trusted else 1.0)
+    bc = _boundary_cost(prev, head)
+    cost += k * bc if bc > 0 else bc
+    return cost
+
+
 def _cut_penalty(prev_text, next_text, strength, free, trusted=False):
     """在"这一行结束/下一行开始"之间断开的代价（越小越该断在这儿）。
 
@@ -818,22 +962,24 @@ def _cut_penalty(prev_text, next_text, strength, free, trusted=False):
     if free:
         return 0.0
     if strength >= PAUSE_STRONG:
-        cost = -1.5                         # 强换气 → 就该在这儿断
+        cost = W_PAUSE_STRONG               # 强换气 → 就该在这儿断
     elif strength >= PAUSE_CAND:
-        cost = -0.5                         # 弱换气 → 可以断
+        cost = W_PAUSE_WEAK                 # 弱换气 → 可以断
     else:
-        cost = 1.0                          # 没有换气 → 尽量别断
+        cost = W_NO_PAUSE                   # 没有换气 → 尽量别断
     if prev_text and next_text:
         if _cut_inside_word(prev_text[-6:], next_text[:8]):
             cost += 30.0                    # 切在词内部 → 基本禁止
         # ⚠ "行尾不能是感動詞"这条不在这里判：这里只有切点前的 12 个词，判不出"这一行
         # 是不是整行就是一个起句词"（「ああはい」这种整行都是起句词的，允许这么结尾）。
         # 它改在 `segment_lines` 里按**整行文本**判（见那里）。
-        if not trusted:
+        # ⚠ 长停顿（>=1.5s）时**不加**"文節被切开"这类语法罚分：人明显停下来了，
+        # 语法罚分压过停顿奖励会让断点挪到上一个词缝（实测一条 10.72s 的静音被切成
+        # 「…良くなります|ようにでの…」，用户标记这两句本来就该在静音处断）。
+        if not trusted and strength < INNER_PAUSE_STRONG:
             cost += _attach_penalty(prev_text[-10:], next_text[:16])
             # 下一行从附属語（助詞/助動詞/接尾）开头 → 把一个文節切开了
-    if not _looks_like_line_end(prev_text):
-        cost += 0.5                         # 行尾不像句末（弱惩罚）
+    cost += _boundary_cost(prev_text, next_text)
     return cost
 
 
@@ -1061,6 +1207,51 @@ def _speech_slices(s0, e0, spans):
     return out
 
 
+def _group_words_to_slices(group, slices):
+    """把一段的词分成**连续的若干组**，一组落在一片语音上；返回 [(i, j), ...]。
+
+    这是"停顿必须落在词与词之间"的关键。老做法是把 whisper 的每个词的时长按比例
+    摊到整段语音上，于是语音之间的**停顿会落在某个词的内部**，两边都坏：
+      * 该断的地方没有词缝 → 怎么都断不开（实测「窓際のテーブルね」+0.67s 停顿+
+        「それは私が持っていくから」：停顿正好落在「それは」这个词里面）；
+      * 不该断的词缝上却被注册了切点 → 断在句子中间（实测 23 处）。
+    分组之后，停顿一定落在词与词之间。
+
+    代价 = Σ |这一组分到的词时长 - 这一片语音应有的词时长|（按整段的语速归一），
+    用 DP 求最小；某一组可以是空的（那一片语音这段里没分到词）。
+    """
+    n, m = len(group), len(slices)
+    if m <= 1 or n == 0:
+        return [(0, n)]
+    w = [max(0.05, b - a) for a, b, _t in group]
+    cum = [0.0]
+    for x in w:
+        cum.append(cum[-1] + x)
+    total_w = cum[-1] or 1.0
+    total_d = sum(b - a for a, b in slices) or 1.0
+    rate = total_w / total_d               # 每秒语音 ≈ 多少"词时长"
+    INF = float("inf")
+    dp = [[INF] * (n + 1) for _ in range(m + 1)]
+    back = [[0] * (n + 1) for _ in range(m + 1)]
+    dp[0][0] = 0.0
+    for si in range(m):
+        target = (slices[si][1] - slices[si][0]) * rate
+        for i in range(n + 1):
+            if dp[si][i] == INF:
+                continue
+            for j in range(i, n + 1):
+                cost = dp[si][i] + abs((cum[j] - cum[i]) - target)
+                if cost < dp[si + 1][j]:
+                    dp[si + 1][j] = cost
+                    back[si + 1][j] = i
+    out, j = [None] * m, n
+    for si in range(m, 0, -1):
+        i = back[si][j]
+        out[si - 1] = (i, j)
+        j = i
+    return out
+
+
 def _retime_words(segments, spans, pauses):
     """把 whisper 的段/词贴回**真实音频时间轴**。
 
@@ -1083,56 +1274,43 @@ def _retime_words(segments, spans, pauses):
                 if words[k][0] - words[k - 1][1] >= PAUSE_CAND}
         return words, cuts, set()
 
-    out, cuts, trusted = [], {}, set()
+    out, trusted = [], set()
     prev_end = None
-    for i, (seg, (s0, e0)) in enumerate(zip(segments, _segment_ranges(segments, spans, pauses))):
+    for seg_i, (seg, (s0, e0)) in enumerate(
+            zip(segments, _segment_ranges(segments, spans, pauses))):
         group = _seg_words(seg)
+        if not group:
+            continue
+        if seg_i and len(out) > 0:
+            # whisper 自己标的句界：拼行时**削弱**（不取消）语法罚分——碎片里 Janome
+            # 会误判（实测「…ですか俺が|はいいつきさんが」被当成"下一行从助詞开头"），
+            # 但也不能像以前那样无条件强制切（实测 23 处"断在句子中间"就是强制切造成的）。
+            trusted.add(len(out))
         s = s0 if prev_end is None else max(s0, prev_end)   # 时间不许倒流
+        # 窗口 = "吸附后的段范围" ∪ "whisper 自己的词时间范围"：吸附是为了修好 whisper
+        # 把段起点吸到很远的地方那种毛病，但吸附本身也会把词甩到别的语音片里去
+        # （实测「ですか」被拆成 です|か、か 被甩到下一个语音片，于是「ですか」被当成
+        #  "切在词内部" +30 罚死）。取并集：两边的好处都留着。
+        # ⚠ 但不许退回到上一段说了话的地方（实测「ああはい」+2.18s+「例えば…」里，
+        # 下一段的 whisper 起点压在上一段的语音上，退回去会把 例えば 摆到静音前）
+        s = max(prev_end or 0.0, min(s, group[0][0]))
+        e0 = max(e0, group[-1][1])
         total = sum(b - a for a, b, _ in group) or 1.0
-        idx0 = len(out)
         slices = [sl for sl in _speech_slices(s, e0, spans) if sl[1] > s]
         if len(slices) > 1:
-            # 这一段中间夹着静音（whisper 常把两句话并成一段）→ 词只铺在语音上，
-            # 静音原样留着，于是切点也正好落在静音上（见下面注册切点那段）。
-            cum = [0.0]
-            for a, b in slices:
-                cum.append(cum[-1] + (b - a))
-            speech_total = cum[-1]
-
-            def to_abs(tau, _s=slices, _c=cum, _st=speech_total):
-                if tau <= 0:
-                    return _s[0][0]
-                if tau >= _st:
-                    return _s[-1][1] + (tau - _st)     # 词比语音长 → 往后延
-                for k in range(len(_s)):
-                    # 边界上取**下一段语音的开头**（正好落在静音起点时，别把词判到静音前）
-                    if tau < _c[k + 1]:
-                        return _s[k][0] + (tau - _c[k])
-                return _s[-1][1]
-
-            scale = min(1.6, max(0.75, max(0.05, speech_total) / total))
-            tau = 0.0
-            for a, b, w in group:
-                d = scale * max(0.05, b - a)
-                start = tau
-                # 这个词自己比"第一小段语音"还长、会跨过静音 → 整个词挪到下一段语音开头
-                # （静音里没人说话，词不能横跨过去；实测「例えば」就被摆进了 2.18s 静音里）
-                for _ in range(len(slices)):
-                    k = None
-                    for si in range(len(slices)):
-                        if start < cum[si + 1]:
-                            k = si
-                            break
-                    if k is None or k + 1 >= len(slices) or start + d <= cum[k + 1]:
-                        break
-                    # 只有**长静音**才值得把词整块挪过去；短换气（句子内部的呼吸）让词
-                    # 原地跨过去就行，否则会把正常位置的词挪到下一段语音里（实测踩到）。
-                    if slices[k + 1][0] - slices[k][1] < INNER_PAUSE_STRONG:
-                        break
-                    start = cum[k + 1]
-                out.append((to_abs(start), to_abs(start + d), w))
-                tau = start + d
-            t = out[-1][1]
+            # 这一段里夹着停顿（whisper 常把好几句话并成一段）：词**整组分片**——
+            # 一组词落在一片语音上，于是停顿一定落在词与词之间（见 _group_words_to_slices）。
+            for (i, j), (a0, b0) in zip(_group_words_to_slices(group, slices), slices):
+                if i >= j:
+                    continue                        # 这片语音这段里没分到词
+                sw = sum(max(0.05, b - a) for a, b, _t in group[i:j]) or 1.0
+                r = (b0 - a0) / sw                  # 这一片语音铺满这一组词
+                t = a0
+                for q in range(i, j):
+                    d = max(0.02, max(0.05, group[q][1] - group[q][0]) * r)
+                    end = b0 if q == j - 1 else min(b0, t + d)
+                    out.append((t, max(end, t + 0.02), group[q][2]))
+                    t += d
         else:
             scale = min(1.6, max(0.75, max(0.05, e0 - s0) / total))
             t = s
@@ -1140,98 +1318,16 @@ def _retime_words(segments, spans, pauses):
                 d = scale * max(0.05, b - a)
                 out.append((t, t + d, w))
                 t += d
-        # 段与段之间的切点：先取"音频实测的停顿"，再把切点**修到语言上合法的位置**——
-        # ① 切在词内部的（whisper 把「将来」切成 将｜来）→ 挪到词首，整词归下一句；
-        # ② 上一段末尾是"只会起句"的词（え・はい・ああ…其实是下一句的开头）→ 挪到下一句。
-        # 不修的话只能整段并进上一行，就是用户说的"开头词被切到上一句里面了"。
-        if i:
-            pause = 0.0
-            if s0 > prev_end:
-                pause = s0 - prev_end                      # 段与段之间的真停顿
-            else:
-                # 吸附有时把两条边界吸到同一条停顿上（中间那段被挤成 0 长度），几何差
-                # 算不出停顿；直接查那条停顿本身，别丢掉这个切点。
-                hit = _nearest_pause((float(segments[i - 1][1]) + float(segments[i][0])) / 2.0,
-                                     pauses, SNAP_TOL)
-                if hit:
-                    pause = hit[2]
-            if pause > 0:
-                prev_group = _seg_words(segments[i - 1])
-                prev_text = segments[i - 1][2] or "".join(w for _a, _b, w in prev_group)
-                cur_text = segments[i][2] or "".join(w for _a, _b, w in group)
-                shift = (_mid_word_shift(prev_text, cur_text)
-                         or _trailing_starter_start(prev_text))
-                idx = idx0
-                if shift and prev_group:                 # 往左挪：这句的词归下一句
-                    base = idx0 - len(prev_group)
-                    j0 = _word_at_char(prev_group, shift)
-                    if j0 is not None:
-                        idx = base + j0
-                    # 挪到词首后**再验一次**：whisper 的词边界和 Janome 的 token 边界不一定
-                    # 重合，还在词内部就继续往左挪，直到干净或挪到这一段开头。
-                    while idx > base:
-                        left = "".join(w for _a, _b, w in prev_group[:idx - base])
-                        if not _cut_inside_word(left[-6:], cur_text[:8]):
-                            break
-                        idx -= 1
-                else:                                    # 往右挪：下一段开头的附属語并回来
-                    lead = _leading_attach_len(cur_text)
-                    if lead:
-                        j1 = _word_at_char(group, lead)
-                        if j1:
-                            idx = idx0 + j1
-                if 0 < idx <= idx0 + len(group):
-                    # 切点右边那一句**自己**的开头不能当句首（が/を/です…）→ 这个句界
-                    # 本身不合法：不发奖励、也不标成可信（拼行时自然并回去）。
-                    if idx != idx0 or not _starts_with_attach(cur_text):
-                        # 可信句界至少按"弱停顿"算：whisper 说这里断句、哪怕音频里没换气，
-                        # 也比把下一句的开头并进上一行强（实测这样又能多救回几处）。
-                        cuts[idx] = max(cuts.get(idx, 0.0), pause, PAUSE_CAND)
-                        trusted.add(idx)
-        # 段内还有停顿的（模型把好几句话并成了一段）：那些词缝也当停顿候选。
-        # 两种才算：
-        #   ① 停顿 >= INNER_PAUSE_STRONG：那是两个人/两句话之间的长静音（实测 1:17 的
-        #      2.18s 就是这种，whisper 把「ああはい」和「例えば…」并成一段、还把时间
-        #      吸到小停顿上）——无条件切；
-        #   ② 这一段的词够长（>= INNER_PAUSE_MIN）时，普通换气（>= 0.3s）也算。
-        #      短段内部的小换气不算：否则「俺は」+「自分自身の問題に…」会被拆碎（踩过）。
-        # 每条停顿只认**离它中心最近的那一个**词缝，否则重铺后有几个缝都落在停顿里，
-        # 会被切好几刀。
-        for pa, pb, gap in pauses:
-            long_pause_before_seg = gap >= INNER_PAUSE_STRONG
-            inner_breath = total >= INNER_PAUSE_MIN and gap >= PAUSE_STRONG
-            if not (long_pause_before_seg or inner_breath):
-                continue
-            best, arg = 1e9, None
-            # ⚠ 长静音只认"本段第一个词之前"那一个缝（idx0）：实测「ああはい」+2.18s 静音+
-            # 「例えば…」里，静音后面紧跟的正是**下一段的第一个词**；而如果放开到段内任意
-            # 位置，会把「…ではない」+长静音+「し」这种段末碎片也切出来（行尾感動詞从 1 涨到 11）。
-            # 段内中段的换气仍走老规矩（段够长才有资格，且从 idx0+1 起找）。
-            cands = []
-            if long_pause_before_seg:
-                cands.append(idx0)                       # 本段第一个词之前那个缝
-            if inner_breath:
-                cands.extend(range(max(idx0 + 1, 1), len(out)))   # 段内中段的换气
-            for k in cands:
-                wstart = out[k][0]
-                if not (pa - 0.05 <= wstart <= pb + 0.05):
-                    continue
-                # 切点必须落在**停顿结束之后**：停顿中间/之前那个词只是被"短换气"跨过去了，
-                # 拿它当切点会切出「…ではない｜しあの北くん…」「…のでついて｜いけるか」这种
-                # 碎片（实测两处）。
-                if wstart < pb - 0.05:
-                    continue
-                d = abs(wstart - (pa + pb) / 2.0)
-                if d < best:
-                    best, arg = d, k
-            if arg is not None:
-                # 同一个位置可能既被段界注册过、又被这里注册：取**更长**的那条停顿
-                cuts[arg] = max(cuts.get(arg, 0.0), gap)
-                # 这是**音频实测的停顿**（不是模型猜的），也算可信句界：拼行时不该再拿
-                # "上一行行尾是不是感動詞"去否掉它——实测「ああはい」+2.18s 静音+「例えば…」
-                # 就是因为这条被否掉，两个人说的话并成了一条。
-                trusted.add(arg)
-        prev_end = t
+        prev_end = out[-1][1]
+
+    # 切点候选 = 重铺后**词与词之间的真实间隔**（词整块落在语音片上，所以词缝处的间隔
+    # 就是音频实测的静音）。不再按 whisper 的段边界强行注册切点：实测那 23 处"断在
+    # 句子中间"全是它干的（段边界处根本没有停顿，或者停顿在别的词缝上）。
+    cuts = {}
+    for k in range(1, len(out)):
+        gap = out[k][0] - out[k - 1][1]
+        if gap >= PAUSE_CAND:
+            cuts[k] = gap
     return out, cuts, trusted
 
 
@@ -1270,6 +1366,14 @@ def segment_lines(segments, spans, pauses, width=None, height=None, main_px=None
     dp = [INF] * (n + 1)
     back = [0] * (n + 1)
     dp[0] = 0.0
+    # 切点代价里"只跟切点本身有关"的部分先按 i 算一次（原来每个 (i,j) 都算，一集几十秒）
+    base_cost = [0.0] * (n + 1)
+    for i in range(1, n + 1):
+        base_cost[i] = _cut_base_cost(texts, i, strength, trusted)
+    # 行尾是不是"只会起句"的词（含在行里判过了，这里只按行尾那一两个词判）
+    tail_starter = [False] * n
+    for j in range(1, n + 1):
+        tail_starter[j - 1] = _ends_with_sentence_starter("".join(texts[max(0, j - 2):j]))
     for j in range(1, n + 1):
         for i in range(j - 1, -1, -1):
             if dp[i] == INF:
@@ -1277,22 +1381,22 @@ def segment_lines(segments, spans, pauses, width=None, height=None, main_px=None
             width_px = pref[j] - pref[i]
             if width_px > limit and i < j - 1:
                 break                       # 再往前加词只会更宽；单个词超宽只能放行
-            if words[j - 1][1] - words[i][0] > 12.0:
-                break                       # 一行不超过 12 秒
-            text = "".join(texts[i:j])
-            cost = dp[i] + _cut_penalty("".join(texts[max(0, i - 12):i]), text,
-                                        strength.get(i, 0.0), i == 0, i in trusted)
-            if i > 0 and _bad_line_start(text):
-                cost += 4.0     # 下一行从格助詞/副助詞开头 → 句子不能这么起（要压过停顿奖励）
+            if words[j - 1][1] - words[i][0] > 12.0 and i < j - 1:
+                break                       # 一行不超过 12 秒（单个词超长只能放行，
+                                            # 拦了会让整条 DP 无解 → 整集塌成 1 行）
+            cost = dp[i] + base_cost[i]
             # 行尾是「いや/え/はい」这种只会起句的词，而这一行**不是**整行都是起句词
             # （不是「ああはい」那种独立应答）→ 这种词不该留在行尾，应该归下一句。
-            if j < n and _ends_with_sentence_starter(text) and not _all_starters(text):
-                cost += 6.0
+            if j < n and tail_starter[j - 1]:
+                joined = "".join(texts[i:j])
+                if len(joined) > 12 or not _all_starters(joined):
+                    cost += 6.0
             dur = words[j - 1][1] - words[i][0]
-            if dur < 0.4:
-                cost += 2.0                 # 一两个词的"闪一下"：宁可丢掉停顿奖励也别留
-            elif dur < 0.7:
-                cost += 0.5
+            if dur < SHORT_LINE_A:
+                cost += PENALTY_A           # 一两个词的"闪一下"：宁可丢掉停顿奖励也别留
+            elif dur < SHORT_LINE_B:
+                cost += PENALTY_B           # （原来是 2.0 / 0.5，太狠：用户要的
+                                            # 「君」「だよね」这种独立短句会被并回上一句）
             elif dur > 8.0:
                 cost += 0.5 * (dur - 8.0)   # 一行太长读不完（12 秒是硬上限）
             if cost < dp[j]:
@@ -1783,4 +1887,13 @@ if __name__ == "__main__":
     # 直接跑这个模块（python -m anime_jp_sub.pipeline）时转给命令行入口
     from .cli import main as _cli_main
     sys.exit(_cli_main())
+
+
+
+
+
+
+
+
+
 
