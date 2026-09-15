@@ -4,6 +4,7 @@
 子命令：
   process   处理：没有日语字幕轨的集数做 听写 → 注音 → 内封（默认子命令）
   scan      只扫描报告，不改任何文件
+  review    给已经处理好的集数生成"评审页"（边看边标哪句断错了 / 哪句漏了）
   doctor    环境自检（外部程序 / python 包 / 模型目录）
   version   打印版本
 
@@ -17,7 +18,7 @@ from pathlib import Path
 
 from . import __version__, common
 
-SUBCOMMANDS = ("process", "scan", "doctor", "version")
+SUBCOMMANDS = ("process", "scan", "review", "doctor", "version")
 
 
 def build_parser():
@@ -45,6 +46,11 @@ def build_parser():
     d = sub.add_parser("doctor", help="环境自检")
     d.add_argument("--download-tools", dest="download_tools", action="store_true",
                    help="顺手把缺的 ffmpeg / MKVToolNix 下到项目 tools/")
+
+    r = sub.add_parser("review", help="生成评审页：边看动画边标「哪句断错了 / 哪句漏了」")
+    _add_target(r)
+    r.add_argument("--force", action="store_true",
+                   help="已有评审页也重新生成（默认跳过）")
     sub.add_parser("version", help="打印版本")
     return ap
 
@@ -74,6 +80,10 @@ def main(argv=None):
         return 0
     if cmd == "doctor":
         return common.doctor(download_tools=getattr(args, "download_tools", False))
+    if cmd == "review":
+        from .qa import review
+        return review.generate(Path(args.target) if args.target else Path.cwd(),
+                               overwrite=args.force)
 
     from . import pipeline
     target = Path(args.target) if args.target else Path.cwd()

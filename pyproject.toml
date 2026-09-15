@@ -28,7 +28,7 @@ anime-jp-sub = "anime_jp_sub.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-anime_jp_sub = ["fonts/*.ttf"]
+anime_jp_sub = ["fonts/*.ttf", "qa/*.html"]
 
 [tool.ruff]
 line-length = 100

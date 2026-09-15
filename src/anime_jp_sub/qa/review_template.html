@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>字幕评审</title>
+<style>
+  :root { --line:#e3e3e3; --bg:#fafafa; --flag:#c2410c; --ok:#166534; --hl:#fff7ed; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:#111;
+         font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif; }
+  header { position:sticky; top:0; background:#fff; border-bottom:1px solid var(--line);
+           padding:10px 16px; z-index:10; }
+  h1 { font-size:16px; margin:0 0 4px; }
+  .hint { color:#555; font-size:12.5px; }
+  .hint b { color:#111; }
+  .bar { margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .bar span.count { color:#555; font-size:12.5px; margin-left:auto; }
+  .warn { display:none; margin-top:6px; padding:6px 8px; background:#fffbeb;
+          border:1px solid #fde68a; color:#92400e; font-size:12.5px; border-radius:4px; }
+  main { padding:8px 16px 60px; }
+  .row { background:#fff; border:1px solid var(--line); border-radius:6px;
+         padding:6px 10px; margin:6px 0; display:flex; gap:10px; align-items:flex-start; }
+  .row.marked { border-color:#fdba74; background:var(--hl); }
+  .row.merged { border-left:6px solid #2563eb; }
+  .row.split { border-left:6px solid #7c3aed; }
+  .row.miss { border-left:6px solid #dc2626; }
+  .num { font:600 13px/1.6 ui-monospace,Consolas,monospace; color:#111; width:46px; flex:none; }
+  .meta { font:12.5px/1.6 ui-monospace,Consolas,monospace; color:#666; width:270px; flex:none; }
+  .flag { color:var(--flag); }
+  .body { flex:1 1 auto; min-width:0; }
+  .text { font-size:17px; line-height:1.9; word-break:break-all; }
+  .text .ch { }
+  .text .gap { display:inline-block; width:0; border-left:1px solid transparent; }
+  .text.splitting { background:#f3e8ff; }
+  .text.splitting .gap { width:2px; margin:0 4px; border-left:1px solid #a855f7;
+                         cursor:pointer; height:1.1em; vertical-align:-0.15em; }
+  .text.splitting .gap:hover { border-left:3px solid #7c3aed; margin:0 3px; }
+  .text .cut { color:#7c3aed; font-weight:700; }
+  .ops { margin-top:4px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  button { font:12.5px/1.2 inherit; padding:3px 8px; border:1px solid #d4d4d4; background:#fff;
+           border-radius:4px; cursor:pointer; }
+  button:hover { background:#f5f5f5; }
+  button.on { background:#2563eb; border-color:#2563eb; color:#fff; }
+  button.on.split-on { background:#7c3aed; border-color:#7c3aed; }
+  button.on.miss-on { background:#dc2626; border-color:#dc2626; }
+  .badge { font-size:12px; color:#2563eb; }
+  input.note { flex:1 1 160px; min-width:120px; padding:3px 6px; border:1px solid #d4d4d4;
+               border-radius:4px; font:12.5px/1.4 inherit; }
+  .missbox { margin-top:4px; padding:5px 7px; background:#fef2f2; border:1px solid #fecaca;
+             border-radius:4px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .missbox input { padding:3px 6px; border:1px solid #d4d4d4; border-radius:4px;
+                   font:12.5px/1.4 inherit; }
+  dialog { width:min(900px,92vw); border:1px solid #ccc; border-radius:8px; }
+  dialog textarea { width:100%; height:340px; font:12.5px/1.5 ui-monospace,Consolas,monospace; }
+  dialog .row2 { display:flex; gap:8px; justify-content:flex-end; margin-top:8px; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">字幕评审</h1>
+  <div class="hint">
+    <b>怎么看</b>：PotPlayer 选「日语」字幕轨，看到断句不对就回来点对应编号。<br>
+    <b>我只标"切分"问题</b>：<b>并入上一条</b>／<b>并入下一条</b>（两句其实是一句）、
+    <b>拆分</b>（一条其实是两句，点字缝选位置）、<b>这里漏字幕</b>（有人说话但没字幕）。
+    识别错（听成别的词）不用管。备注随便写。
+  </div>
+  <div class="bar">
+    <label><input type="checkbox" id="onlyFlag"> 只看可疑</label>
+    <button id="exportBtn">导出结果</button>
+    <button id="resetBtn">清空所有标记</button>
+    <span class="count" id="count"></span>
+  </div>
+  <div class="warn" id="warn"></div>
+</header>
+<main id="list"></main>
+
+<dialog id="dlg">
+  <p style="margin:0 0 6px">这就是要发回给我的内容（直接复制粘贴即可）：</p>
+  <textarea id="exportText" readonly></textarea>
+  <div class="row2">
+    <button id="copyBtn">复制到剪贴板</button>
+    <button id="dlgClose">关闭</button>
+  </div>
+</dialog>
+
+<script>
+const META = /*__META__*/;
+const DATA = /*__DATA__*/;
+const STORE_KEY = META.key;
+
+let state = { merge: {}, split: {}, note: {}, miss: [] };
+let splitMode = 0;
+let onlyFlag = false;
+
+function load() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (raw) { state = Object.assign(state, JSON.parse(raw)); }
+    return true;
+  } catch (e) {
+    document.getElementById("warn").style.display = "block";
+    document.getElementById("warn").textContent =
+      "注意：浏览器不允许本页自动保存（本地文件限制），标记只存在这个页面里 —— " +
+      "看完请点『导出结果』复制出来，别直接关标签页。";
+    return false;
+  }
+}
+
+function save() {
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {}
+  renderCount();
+}
+
+function ts(x) {
+  const m = Math.floor(x / 60);
+  const s = x - m * 60;
+  return String(m).padStart(2, "0") + ":" + s.toFixed(2).padStart(5, "0");
+}
+
+function flagCount() {
+  return DATA.filter((d) => d.flag).length;
+}
+
+function renderCount() {
+  const merges = Object.values(state.merge).filter(Boolean).length;
+  const splits = Object.values(state.split).filter((v) => v > 0).length;
+  const misses = state.miss.length;
+  const notes = Object.values(state.note).filter((v) => v && v.trim()).length;
+  document.getElementById("count").textContent =
+    `已标：合并 ${merges} · 拆分 ${splits} · 漏句 ${misses} · 备注 ${notes}` +
+    `　|　共 ${DATA.length} 条，自动可疑 ${flagCount()} 条`;
+}
+
+function esc(t) {
+  return t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function renderText(d) {
+  const cut = state.split[d.n] || 0;
+  let html = "";
+  for (let i = 0; i < d.t.length; i++) {
+    html += `<span class="gap" data-i="${i}"></span><span class="ch">${esc(d.t[i])}</span>`;
+    if (cut === i + 1) html += `<span class="cut">¦</span>`;
+  }
+  html += `<span class="gap" data-i="${d.t.length}"></span>`;
+  return html;
+}
+
+function render() {
+  const list = document.getElementById("list");
+  let html = "";
+  DATA.forEach((d) => {
+    if (onlyFlag && !d.flag) return;
+    const merged = !!state.merge[d.n];
+    const prevMerged = !!state.merge[d.n - 1];
+    const cut = state.split[d.n] || 0;
+    const miss = state.miss.filter((m) => m.after === d.n);
+    const cls = ["row"];
+    if (merged || prevMerged) cls.push("merged");
+    if (cut) cls.push("split");
+    if (miss.length) cls.push("miss");
+    html += `<div class="${cls.join(" ")}" data-n="${d.n}">
+      <div class="num">#${String(d.n).padStart(3, "0")}</div>
+      <div class="meta">${ts(d.s)} → ${ts(d.e)}<br>${(d.e - d.s).toFixed(1)}s ·
+        ${d.t.length}字${d.flag ? ` <span class="flag">${esc(d.flag)}</span>` : ""}</div>
+      <div class="body">
+        <div class="text ${splitMode === d.n ? "splitting" : ""}">${renderText(d)}</div>
+        <div class="ops">
+          <button data-act="up" class="${prevMerged ? "on" : ""}">${prevMerged ? "✓ 已并入上一条" : "并入上一条"}</button>
+          <button data-act="down" class="${merged ? "on" : ""}">${merged ? "✓ 与下一条相连" : "并入下一条"}</button>
+          <button data-act="split" class="${splitMode === d.n ? "on split-on" : ""}">拆分</button>
+          <button data-act="miss" class="${miss.length ? "on miss-on" : ""}">这里漏字幕</button>
+          <button data-act="time">复制时间</button>
+          <input class="note" placeholder="备注（可空）" value="${esc(state.note[d.n] || "")}">
+        </div>
+        ${miss.map((m) => `<div class="missbox">
+          <span>在这条<b>之后</b>有人说话但没字幕：</span>
+          <input class="mt" size="10" placeholder="时间 如 12:34.5" value="${esc(m.time || "")}">
+          <input class="mx" size="34" placeholder="听到的台词（可留空）" value="${esc(m.text || "")}">
+          <button data-act="miss-del">删掉</button></div>`).join("")}
+      </div>
+    </div>`;
+  });
+  list.innerHTML = html;
+  renderCount();
+}
+
+function findRow(el) {
+  const row = el.closest(".row");
+  return row ? Number(row.dataset.n) : 0;
+}
+
+document.addEventListener("click", (ev) => {
+  const t = ev.target;
+  if (t.classList && t.classList.contains("gap") && splitMode) {
+    const n = findRow(t);
+    const i = Number(t.dataset.i);
+    state.split[n] = state.split[n] === i ? 0 : i;
+    splitMode = 0;
+    save();
+    render();
+    return;
+  }
+  if (!t.dataset || !t.dataset.act) return;
+  const n = findRow(t);
+  const act = t.dataset.act;
+  if (act === "up") { toggleMerge(n - 1); }
+  if (act === "down") { toggleMerge(n); }
+  if (act === "split") { splitMode = splitMode === n ? 0 : n; }
+  if (act === "miss") { state.miss.push({ after: n, time: "", text: "" }); }
+  if (act === "miss-del") {
+    const box = t.closest(".missbox");
+    const idx = Array.from(box.parentNode.querySelectorAll(".missbox")).indexOf(box);
+    const all = state.miss.filter((m) => m.after === n);
+    state.miss.splice(state.miss.indexOf(all[idx]), 1);
+  }
+  if (act === "time") {
+    copyText(ts(DATA[n - 1].e));
+    t.textContent = "已复制 ✓";
+    setTimeout(() => { t.textContent = "复制时间"; }, 1200);
+    return;
+  }
+  save();
+  render();
+});
+
+function toggleMerge(k) {
+  if (k < 1 || k >= DATA.length) return;
+  if (state.merge[k]) delete state.merge[k];
+  else state.merge[k] = true;
+}
+
+document.addEventListener("input", (ev) => {
+  const t = ev.target;
+  const n = findRow(t);
+  if (t.classList.contains("note")) { state.note[n] = t.value; save(); return; }
+  if (t.classList.contains("mt") || t.classList.contains("mx")) {
+    const all = state.miss.filter((m) => m.after === n);
+    const box = t.closest(".missbox");
+    const idx = Array.from(box.parentNode.querySelectorAll(".missbox")).indexOf(box);
+    if (all[idx]) all[idx][t.classList.contains("mt") ? "time" : "text"] = t.value;
+    save();
+  }
+});
+
+document.getElementById("onlyFlag").addEventListener("change", (ev) => {
+  onlyFlag = ev.target.checked;
+  render();
+});
+
+function copyText(s) {
+  const ta = document.createElement("textarea");
+  ta.value = s;
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); } catch (e) {}
+  document.body.removeChild(ta);
+}
+
+function exportLines() {
+  const out = [];
+  out.push(`# ${META.title} 字幕评审`);
+  out.push(`# 总条数 ${DATA.length}`);
+  const merges = Object.keys(state.merge).map(Number).filter((n) => state.merge[n]).sort((a, b) => a - b);
+  merges.forEach((n) => {
+    const a = DATA[n - 1], b = DATA[n];
+    out.push(`合并 ${String(n).padStart(3, "0")}-${String(n + 1).padStart(3, "0")}   ` +
+             `[${ts(a.s)} ${a.t}] + [${ts(b.s)} ${b.t}]  → 应该是一条`);
+  });
+  Object.keys(state.split).map(Number).sort((a, b) => a - b).forEach((n) => {
+    const i = state.split[n];
+    if (!i) return;
+    const d = DATA[n - 1];
+    out.push(`拆分 ${String(n).padStart(3, "0")} @ 第${i}字后   [${ts(d.s)} ${d.t}]` +
+             `  → 前「${d.t.slice(0, i)}」/ 后「${d.t.slice(i)}」`);
+  });
+  state.miss.forEach((m) => {
+    out.push(`漏句 第${String(m.after).padStart(3, "0")}条之后 时间「${m.time || "?"}」` +
+             ` 台词「${m.text || ""}」`);
+  });
+  Object.keys(state.note).map(Number).sort((a, b) => a - b).forEach((n) => {
+    if (state.note[n] && state.note[n].trim()) {
+      out.push(`备注 ${String(n).padStart(3, "0")}  ${state.note[n].trim()}`);
+    }
+  });
+  if (out.length === 2) out.push("（还没有任何标记）");
+  return out.join("\n") + "\n";
+}
+
+document.getElementById("exportBtn").addEventListener("click", () => {
+  const ta = document.getElementById("exportText");
+  ta.value = exportLines();
+  document.getElementById("dlg").showModal();
+  ta.focus();
+  ta.setSelectionRange(0, ta.value.length);
+});
+document.getElementById("dlgClose").addEventListener("click", () =>
+  document.getElementById("dlg").close());
+document.getElementById("copyBtn").addEventListener("click", () => {
+  copyText(document.getElementById("exportText").value);
+  document.getElementById("copyBtn").textContent = "已复制 ✓";
+});
+document.getElementById("resetBtn").addEventListener("click", () => {
+  if (confirm("清空所有标记？")) { state = { merge: {}, split: {}, note: {}, miss: [] }; save(); render(); }
+});
+
+document.getElementById("title").textContent = META.title + " — 字幕评审";
+document.title = META.title + " — 字幕评审";
+load();
+render();
+</script>
+</body>
+</html>
