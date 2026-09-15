@@ -607,7 +607,7 @@ def _transcribe_once(device, compute_type, wav_path, max_end):
                   f"耗时 {now-t_start:.0f}s，共 {len(seg_list)} 句", flush=True)
             last_print = now
     print(f"  [转写] 完成，共 {len(seg_list)} 句，用时 {time.monotonic()-t_start:.0f}s", flush=True)
-    return seg_list, total_dur
+    return seg_list, total_dur, model        # 模型也带出去：补漏那一遍要复用，别加载两次
 
 
 # ===== 日语自己断句（不再依赖中文字幕轨） =====
@@ -628,6 +628,25 @@ SNAP_TOL = 0.60              # whisper 的段边界离停顿多远以内，就�
 INNER_PAUSE_MIN = 3.5        # 段内停顿只有当这一段词时长 >= 3.5s（一行肯定放不下）才算切点
 INNER_PAUSE_STRONG = 1.5     # 段内停顿 >= 1.5s 的**无条件**算切点：实测那是两个人/两句话
                              # 之间的长静音（whisper 会把两句话并成一段，时间戳也不准）
+# ===== 第二遍补漏（2026-09-15 用户逐条人工审核一集之后加的）=====
+# 依据：用户拿着"字幕空档候选清单"逐条听，确认 25 处真漏、4 处不是（咳嗽/隔壁尾巴/已有字幕正常）。
+# 三个关键事实：
+#   * 漏句的根因是**第一遍的 VAD 把那段当静音滤掉了**（小声说话、叠着 BGM、短促应答最容易中招）。
+#     同一个窗口关掉 vad_filter 之后，whisper 自己就听回来了（43 条候选里救回 42 条，
+#     而且文本质量比 SenseVoice 更好）——所以补漏要的是"换个切块方式"，不是换模型；
+#   * 窗口不能只看"VAD 静音"：用户确认的漏句里最短的停顿只有 0.8s，04:19 那句甚至跨了
+#     1.31s 停顿 + 0.26s 语音片。所以窗口取**字幕时间轴上的空档**（>= RECOVER_MIN_GAP）；
+#   * 也不是所有空档都值得听：离 VAD 语音段太远（长时间没人说话）的窗口跳过，音量接近静音的
+#     也跳过；结果与相邻字幕字符重合度高的丢弃（那只是把隔壁那句的尾巴又听了一遍）。
+#     ⚠ OP/ED 不做特殊处理：用户明确要求跟正文一视同仁，该听的照听。
+RECOVER = True               # [align] recover = off 可以关掉这一步
+RECOVER_MIN_GAP = 0.8        # 字幕空档 >= 0.8s 才检查（实测最短的真漏句就是这个量级）
+RECOVER_PAD = 0.6            # 窗口前后各多听一点，免得句首被切掉
+RECOVER_NEAR_SPEECH = 3.0    # 离 VAD 语音段超过这个距离的窗口不看（长时间没人说话的地方）
+RECOVER_OVERLAP = 0.5        # 与相邻字幕的字符二元组重合度 >= 0.5 → 不是新内容
+RECOVER_MIN_CHARS = 2        # 太短的结果不要（语气词碎片）
+RECOVER_MAX_WINDOW = 12.0    # 长空档切成 <= 这个长度的小窗再听（一次喂几十秒容易听成一坨）
+RECOVER_SILENT_RMS = 0.004   # 窗口音量低于这个值当静音（关 VAD 的 whisper 会在这里幻觉出整句）
 _END_PUNCT = "。！？!?…"
 
 # ===== 断句打分用的权重 =====
@@ -1207,6 +1226,136 @@ def _speech_slices(s0, e0, spans):
     return out
 
 
+def _strip_punct(text):
+    """去掉标点和空白，只留内容字符（比对"这句是不是已经有了"时用）。"""
+    drop = "。、！？…?!「」（）『』・ 　"
+    return "".join(c for c in text if c not in drop)
+
+
+def _char_bigrams(text):
+    t = _strip_punct(text)
+    return {t[i:i + 2] for i in range(max(1, len(t) - 1))} or {t}
+
+
+def _overlap_ratio(text, ref):
+    """text 的字符二元组有多大比例出现在 ref 里（判"是不是同一句"）。"""
+    if not ref:
+        return 0.0
+    bg, rf = _char_bigrams(text), _char_bigrams(ref)
+    return sum(1 for g in bg if g in rf) / max(1, len(bg))
+
+
+def recover_windows(lines, spans, min_gap=None, near=None):
+    """补漏的候选窗口 = 字幕时间轴上的空档（>= min_gap，且离 VAD 语音段不超过 near 秒）。
+
+    长空档（> RECOVER_MAX_WINDOW）**切成小窗**而不是整段丢掉：一次喂 30~70 秒给
+    whisper 容易一段听成一大坨（时间也不好对），而用户确认的漏句里就有 13.4s / 15.6s /
+    16.9s / 31.5s / 54s 的长空档，所以按 ≤12s 切块、逐块用"离 VAD 语音段的距离"筛。
+    （OP/ED 不做特殊处理——用户明确要求跟正文一视同仁。）
+    """
+    min_gap = RECOVER_MIN_GAP if min_gap is None else min_gap
+    near = RECOVER_NEAR_SPEECH if near is None else near
+    ordered = sorted(lines)
+    out = []
+    for i in range(len(ordered) - 1):
+        a, b = ordered[i][1], ordered[i + 1][0]
+        if b - a < min_gap:
+            continue
+        # 切成 <= RECOVER_MAX_WINDOW 的小块
+        k = 0
+        while a + k * RECOVER_MAX_WINDOW < b - 1e-6:
+            w0 = a + k * RECOVER_MAX_WINDOW
+            w1 = min(b, w0 + RECOVER_MAX_WINDOW)
+            k += 1
+            if w1 - w0 < min_gap:
+                continue
+            # 窗口里必须**真的检测到过语音**（VAD 语音段和窗口有实质重叠），否则不听：
+            # 关掉 VAD 的 whisper 在"只有音乐/环境声"的地方会幻觉出整句
+            # （实测在 OP 段凭空写出「ご視聴ありがとうございました」、在咳嗽处写出人名）。
+            # 注意这里用的还是第一遍那份 VAD 结果，不是"看过字幕没有"——两回事。
+            if spans and not any(min(w1 + near, e) - max(w0 - near, s) >= 0.15 for s, e in spans):
+                continue
+            out.append((w0, w1))
+    return out
+
+
+def recover_missed(model, wav_path, lines, spans, min_gap=None, pad=None):
+    """第二遍补漏：对候选窗口**关掉 VAD** 重听一遍，把漏掉的句子/半句捞回来。
+
+    返回 (新的 lines, 报告 dict)。新 lines = 原有每条 + 新增条 + 被补成整句的原有条。
+    ⚠ 只加不减：原有字幕一条不动，避免把用户已经审过的断句搅乱。
+    """
+    min_gap = RECOVER_MIN_GAP if min_gap is None else min_gap
+    pad = RECOVER_PAD if pad is None else pad
+    lines = [list(x) for x in lines]
+    # ⚠ 参照系永远是**进来时那份**字幕：不能拿"边加边长的 lines"去比，
+    # 否则新加的条会互相压制，越到后面越加不进去（实测召回率从 21/24 掉到 12/24）。
+    base = [list(x) for x in lines]
+    windows = recover_windows(lines, spans, min_gap)
+    added, extended, checked = [], 0, 0
+    try:
+        # 音频只解码一次：下面既拿它判"静音窗口"，又把窗口切片**直接喂给模型**。
+        # ⚠ 不要用 clip_timestamps 让 faster-whisper 自己去切：那样每次调用都会把整段音频
+        #   重新解码一遍，98 个窗口要多花 3 分钟（实测 199s → 优化后 ~30s）。
+        from faster_whisper.audio import decode_audio
+        import numpy as _np
+        audio = decode_audio(str(wav_path), sampling_rate=16000)
+    except Exception:                                 # noqa: BLE001
+        audio = None
+    for a, b in windows:
+        a2, b2 = max(0.0, a - pad), b + pad
+        checked += 1
+        if audio is not None:
+            seg = audio[int(a2 * 16000):int(b2 * 16000)]
+            if len(seg) and float(_np.sqrt((seg ** 2).mean())) < RECOVER_SILENT_RMS:
+                continue                              # 静音窗口（咳嗽音/纯环境声也在这类）
+        src, offset = (audio[int(a2 * 16000):int(b2 * 16000)], a2) if audio is not None \
+            else (str(wav_path), 0.0)
+        segs, _info = model.transcribe(
+            src, language=LANG, beam_size=BEAM_SIZE,
+            vad_filter=False,                       # ← 关键：这一遍不看 VAD，让它自己听
+            word_timestamps=True, condition_on_previous_text=False)
+        for s in segs:                              # 必须消费生成器
+            txt = (s.text or "").strip()
+            if len(_strip_punct(txt)) < RECOVER_MIN_CHARS:
+                continue
+            # ⚠ 试过用 whisper 自己的置信度（no_speech_prob / avg_logprob）丢幻觉，**别用**：
+            # 那些真漏句本来就是"小声 / 压着 BGM"，模型自己对它们也没信心，一过滤
+            # 召回率从 21/24 掉到 14/24，而误报只从 5 降到 4。要压幻觉得靠别的信号。
+            st, en = float(s.start) + offset, float(s.end) + offset
+            # ① 和**已有**字幕撞上了吗？判据用"这一条的时间有多大比例被某条已有字幕盖住"，
+            #    而不是"中点落在它的 ±0.4s 里"——后者会把紧挨着上一条的新句子误判成同一条
+            #    （实测「どうしてはるちゃんがここに」被这么丢掉，召回率掉一半）。
+            hit, best = None, 0.0
+            for row in base:
+                ov = min(en, row[1]) - max(st, row[0])
+                if ov > 0 and ov / max(0.01, en - st) > best:
+                    hit, best = row, ov / max(0.01, en - st)
+            if hit is not None and best >= 0.6:
+                if (_strip_punct(txt) not in _strip_punct(hit[2])
+                        and _overlap_ratio(hit[2], txt) >= 0.5
+                        and len(_strip_punct(txt)) > len(_strip_punct(hit[2]))):
+                    hit[2] = txt
+                    hit[0] = min(hit[0], st)
+                    hit[1] = max(hit[1], en)
+                    extended += 1
+                continue
+            # ② 和相邻字幕高度重合 → 只是把隔壁的尾巴又听了一遍，丢掉
+            near_text = "".join(x for s0, e0, x in base if e0 > st - 2 and s0 < en + 2)
+            if _overlap_ratio(txt, near_text) >= RECOVER_OVERLAP:
+                continue
+            added.append([st, en, txt])
+            lines.append([st, en, txt])
+    # 时间上夹紧：相邻两条不许同时显示（会叠在一起）
+    lines.sort(key=lambda r: r[0])
+    for i, row in enumerate(lines):
+        if i and row[0] < lines[i - 1][1] + 0.05:
+            row[0] = lines[i - 1][1] + 0.05
+        if i + 1 < len(lines) and row[1] > lines[i + 1][0] - 0.05:
+            row[1] = max(row[0] + 0.3, lines[i + 1][0] - 0.05)
+    return lines, {"windows": checked, "added": len(added), "extended": extended}
+
+
 def _group_words_to_slices(group, slices):
     """把一段的词分成**连续的若干组**，一组落在一片语音上；返回 [(i, j), ...]。
 
@@ -1429,7 +1578,8 @@ def segment_lines(segments, spans, pauses, width=None, height=None, main_px=None
     return [(s, e, t) for s, e, t in entries if t]
 
 
-def transcribe(wav_path, timeline, max_end, video=None, main_px=None, mode="jp"):
+def transcribe(wav_path, timeline, max_end, video=None, main_px=None, mode="jp",
+               recover=None):
     """faster-whisper large-v3 听写，返回对齐好的 [(start, end, text), ...]。
 
     word_timestamps=True：只有拿到词级时间，才能把 Whisper"两句并一段"的输出
@@ -1451,7 +1601,7 @@ def transcribe(wav_path, timeline, max_end, video=None, main_px=None, mode="jp")
               flush=True)
     while True:
         try:
-            seg_list, total_dur = _transcribe_once(device, compute_type, wav_path, max_end)
+            seg_list, total_dur, model = _transcribe_once(device, compute_type, wav_path, max_end)
             break
         except Exception as e:                          # noqa: BLE001
             if device == "cuda" and _cuda_runtime_error(e):
@@ -1477,6 +1627,16 @@ def transcribe(wav_path, timeline, max_end, video=None, main_px=None, mode="jp")
                                  width=video[0] if video else None,
                                  height=video[1] if video else None,
                                  main_px=main_px)
+        # 第二遍补漏：第一遍的 VAD 会把"小声说话 / 叠着 BGM / 短促应答"当静音滤掉，
+        # 那些地方在字幕时间轴上就是一段空档。这里对空档关掉 VAD 重听一遍（详见 recover_missed）。
+        if (RECOVER if recover is None else recover):
+            try:
+                seg_list, rep = recover_missed(model, wav_path, seg_list, spans)
+                if rep["windows"]:
+                    print(f"  [补漏] 检查 {rep['windows']} 个字幕空档："
+                          f"新增 {rep['added']} 条 / 补全 {rep['extended']} 条", flush=True)
+            except Exception as e:                       # noqa: BLE001
+                print(f"  [warn] 补漏这一步失败（{e}），按原结果继续")
     return seg_list, total_dur, qa_stats(seg_list, total_dur)
 
 
@@ -1887,13 +2047,4 @@ if __name__ == "__main__":
     # 直接跑这个模块（python -m anime_jp_sub.pipeline）时转给命令行入口
     from .cli import main as _cli_main
     sys.exit(_cli_main())
-
-
-
-
-
-
-
-
-
 
