@@ -63,6 +63,8 @@ def build_parser():
                     help="那集的听写结果（.jp.dump.json，来自 process --keep-dump）")
     sc.add_argument("--tolerance", type=int, default=1,
                     help="允许差几个词缝算命中（默认 1，别改成 0 除非你知道为什么）")
+    sc.add_argument("-v", "--verbose", action="store_true",
+                    help="逐条列出没通过的（带时间码，方便回听）")
     sub.add_parser("version", help="打印版本")
     return ap
 
@@ -100,7 +102,7 @@ def main(argv=None):
         from .qa.score.run import run as score_run
         return score_run(args.marks, args.baseline, args.dump,
                          tolerance=args.tolerance,
-                         verbose=("-v" in argv or "--verbose" in argv))
+                         verbose=args.verbose)
 
     from . import pipeline
     target = Path(args.target) if args.target else Path.cwd()
