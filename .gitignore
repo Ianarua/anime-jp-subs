@@ -17,3 +17,11 @@ anime_jp_sub.log
 *.wav
 *.jp.mkv
 *.jpc.mkv
+
+# ===== 本地开发用（不进仓库，只在 dev）=====
+# _local/ 放的是"归档的探针/验证脚本 + 每集产物"：给以后复现结论用，别人 clone 不需要。
+# 详见 _local/README.md。
+_local/
+*.review.html
+*.review.txt
+*.jp.dump.json
