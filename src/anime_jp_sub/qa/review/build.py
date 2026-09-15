@@ -21,8 +21,9 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from .. import common
-from .. import pipeline
+from ... import common
+from ... import pipeline
+from .. import common as qa_common
 
 # 行尾是这些 → 像一句话说完（跟断句算法里用的一致）
 END_PUNCT = "。！？…?!"
@@ -67,25 +68,7 @@ def build_rows(entries, pauses):
     return rows
 
 
-def _sec(text):
-    """'0:00:07.85' → 7.85"""
-    h, m, s = text.split(":")
-    return int(h) * 3600 + int(m) * 60 + float(s)
-
-
-def read_ass_entries(ass_path):
-    """从 ASS 里抽出**正文**行（注音是单独的行、样式是 RB，必须排除）。"""
-    rows = []
-    for line in Path(ass_path).read_text(encoding="utf-8-sig", errors="replace").splitlines():
-        if not line.startswith("Dialogue:"):
-            continue
-        parts = line[len("Dialogue:"):].split(",", 9)
-        if parts[3].strip() not in ("JP", "Default"):
-            continue
-        text = re.sub(r"\{[^}]*\}", "", parts[9]).strip()
-        if text:
-            rows.append((_sec(parts[1].strip()), _sec(parts[2].strip()), text))
-    return rows
+from ..common import read_ass_entries, read_entries      # noqa: F401  （共用：读正文行）
 
 
 def render_txt(rows, title):
@@ -104,7 +87,7 @@ def render_txt(rows, title):
 
 def template_path():
     """页面模板（随包分发）。"""
-    return Path(__file__).with_name("review_template.html")
+    return Path(__file__).with_name("template.html")
 
 
 def render_html(rows, title, key=None):
@@ -115,16 +98,6 @@ def render_html(rows, title, key=None):
                .replace("/*__DATA__*/", json.dumps(rows, ensure_ascii=False)))
 
 
-def jpn_subtitle_stream(mkv):
-    """(ffmpeg 用的字幕序号, 语言标签)：挑第一条日语字幕轨；没有就返回 (None, None)。"""
-    _audios, subs = pipeline.probe_streams(mkv)
-    for idx, st in enumerate(subs):
-        lang = (st.get("tags") or {}).get("language", "").lower()
-        if lang in ("jpn", "ja", "japanese"):
-            return idx, lang
-    return None, None
-
-
 def generate_one(mkv, overwrite=False, keep_wav=False):
     """给一集 mkv 生成评审页（HTML + TXT），返回 (html 路径, txt 路径, 条目数)。"""
     mkv = Path(mkv)
@@ -133,17 +106,11 @@ def generate_one(mkv, overwrite=False, keep_wav=False):
     if html_path.exists() and not overwrite:
         return html_path, txt_path, 0
 
-    sub_idx, lang = jpn_subtitle_stream(str(mkv))
-    if sub_idx is None:
-        raise RuntimeError("这集没有日语字幕轨（先跑 process，或换一集）")
     tmp = Path(tempfile.mkdtemp(prefix="anime-jp-sub-review-"))
     try:
         sub_path = tmp / "sub.ass"
-        code, out = common.run([common.FFMPEG, "-v", "error", "-y", "-i", str(mkv),
-                                "-map", "0:s:%d" % sub_idx, "-c", "copy", str(sub_path)])
-        if code != 0:
-            raise RuntimeError("抽出日语字幕失败：%s" % out)
-        entries = read_ass_entries(sub_path)
+        qa_common.extract_subtitle(mkv, sub_path)
+        entries = qa_common.read_entries(sub_path)
         # 停顿用音频现算（跟断句用的是同一套 silero VAD 参数）——页面上的 ⚠跨停顿 靠它
         audios, _subs = pipeline.probe_streams(str(mkv))
         audio = pipeline.pick_audio(str(mkv), audios)

@@ -5,6 +5,7 @@
   process   处理：没有日语字幕轨的集数做 听写 → 注音 → 内封（默认子命令）
   scan      只扫描报告，不改任何文件
   review    给已经处理好的集数生成"评审页"（边看边标哪句断错了 / 哪句漏了）
+  score     拿人工评审的标记给切分算法打分（开发/调参用，见 dev 分支的 qa/score）
   doctor    环境自检（外部程序 / python 包 / 模型目录）
   version   打印版本
 
@@ -18,7 +19,7 @@ from pathlib import Path
 
 from . import __version__, common
 
-SUBCOMMANDS = ("process", "scan", "review", "doctor", "version")
+SUBCOMMANDS = ("process", "scan", "review", "score", "doctor", "version")
 
 
 def build_parser():
@@ -32,6 +33,8 @@ def build_parser():
     _add_target(p)
     p.add_argument("--keep-srt", action="store_true",
                    help="保留生成的字幕文件供调试（默认用完即弃）")
+    p.add_argument("--keep-dump", dest="keep_dump", action="store_true",
+                   help="保留这集的听写+VAD 结果（.jp.dump.json），给 qa/score 打分用")
     p.add_argument("--no-furigana", dest="furigana", action="store_false",
                    help="不生成平假名注音，退回普通 SRT 字幕轨")
     p.add_argument("--all", action="store_true",
@@ -51,6 +54,15 @@ def build_parser():
     _add_target(r)
     r.add_argument("--force", action="store_true",
                    help="已有评审页也重新生成（默认跳过）")
+
+    sc = sub.add_parser("score", help="拿评审标记给切分算法打分（开发/调参用）")
+    sc.add_argument("marks", help="评审页导出的标记文本")
+    sc.add_argument("--baseline", required=True,
+                    help="人当时审的那份产物（.ass/.srt）——标记的行号属于它")
+    sc.add_argument("--dump", required=True,
+                    help="那集的听写结果（.jp.dump.json，来自 process --keep-dump）")
+    sc.add_argument("--tolerance", type=int, default=1,
+                    help="允许差几个词缝算命中（默认 1，别改成 0 除非你知道为什么）")
     sub.add_parser("version", help="打印版本")
     return ap
 
@@ -84,6 +96,11 @@ def main(argv=None):
         from .qa import review
         return review.generate(Path(args.target) if args.target else Path.cwd(),
                                overwrite=args.force)
+    if cmd == "score":
+        from .qa.score.run import run as score_run
+        return score_run(args.marks, args.baseline, args.dump,
+                         tolerance=args.tolerance,
+                         verbose=("-v" in argv or "--verbose" in argv))
 
     from . import pipeline
     target = Path(args.target) if args.target else Path.cwd()
@@ -93,7 +110,8 @@ def main(argv=None):
     if cmd == "scan":
         return pipeline.scan(target)
     return pipeline.process(target, keep_srt=args.keep_srt, use_furigana=args.furigana,
-                            auto_download_tools=args.download_tools)
+                            auto_download_tools=args.download_tools,
+                            keep_dump=args.keep_dump)
 
 
 if __name__ == "__main__":

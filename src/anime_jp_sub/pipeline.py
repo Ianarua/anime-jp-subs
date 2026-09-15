@@ -1579,7 +1579,7 @@ def segment_lines(segments, spans, pauses, width=None, height=None, main_px=None
 
 
 def transcribe(wav_path, timeline, max_end, video=None, main_px=None, mode="jp",
-               recover=None):
+               recover=None, dump_out=None):
     """faster-whisper large-v3 听写，返回对齐好的 [(start, end, text), ...]。
 
     word_timestamps=True：只有拿到词级时间，才能把 Whisper"两句并一段"的输出
@@ -1618,6 +1618,7 @@ def transcribe(wav_path, timeline, max_end, video=None, main_px=None, mode="jp",
         seg_list = align_timeline(seg_list, timeline, max_end, total_dur)
     else:
         # 新路径：日语自己断句——VAD 停顿当换气点，DP 按单行宽度拼行，时间跟语音走
+        raw_segs = seg_list          # 听写原始结果（打分要拿它复算，别被下面的行覆盖）
         spans, pauses = detect_pauses(wav_path)
         if spans:
             print(f"  [断句] VAD: 语音 {len(spans)} 段 / 停顿 {len(pauses)} 处", flush=True)
@@ -1637,6 +1638,18 @@ def transcribe(wav_path, timeline, max_end, video=None, main_px=None, mode="jp",
                           f"新增 {rep['added']} 条 / 补全 {rep['extended']} 条", flush=True)
             except Exception as e:                       # noqa: BLE001
                 print(f"  [warn] 补漏这一步失败（{e}），按原结果继续")
+        # 留一份"听写 + VAD"的结果，给 `anime-jp-sub score` 打分用（不用再跑一遍 whisper）
+        if dump_out:
+            try:
+                Path(dump_out).write_text(json.dumps(
+                    {"segs": [list(x) for x in raw_segs],
+                     "spans": [list(x) for x in spans],
+                     "pauses": [list(x) for x in pauses],
+                     "lines": [list(x) for x in seg_list]},
+                    ensure_ascii=False), encoding="utf-8")
+                print(f"  听写 dump -> {Path(dump_out).name}", flush=True)
+            except Exception as e:                       # noqa: BLE001
+                print(f"  [warn] 写 dump 失败：{e}")
     return seg_list, total_dur, qa_stats(seg_list, total_dur)
 
 
@@ -1865,7 +1878,8 @@ def scan(target):
     return 0
 
 
-def process(target, keep_srt=False, use_furigana=True, auto_download_tools=False):
+def process(target, keep_srt=False, use_furigana=True, auto_download_tools=False,
+            keep_dump=False):
     """处理入口：扫描目标 → 该做的做掉 → 打印汇总。返回退出码（有失败就是 1）。
     日志：控制台照旧显示，同时追加写一份到被扫描目录下的 anime_jp_sub.log。"""
     common.setup_console()
@@ -1880,14 +1894,14 @@ def process(target, keep_srt=False, use_furigana=True, auto_download_tools=False
         except Exception as e:                      # noqa: BLE001
             print(f"  [warn] 打不开日志文件：{e}（只在控制台输出）")
     try:
-        return _run(keep_srt, use_furigana, target, auto_download_tools)
+        return _run(keep_srt, use_furigana, target, auto_download_tools, keep_dump)
     finally:
         if log is not None:
             sys.stdout = log.console
             log.close()
 
 
-def _run(keep_srt, use_furigana, target, auto_download_tools=False):
+def _run(keep_srt, use_furigana, target, auto_download_tools=False, keep_dump=False):
     t_run = time.monotonic()
 
     # 连"要不要处理"都得靠 ffprobe 判断，所以先确认它在（缺了可以问一句自动下）
@@ -1946,8 +1960,10 @@ def _run(keep_srt, use_furigana, target, auto_download_tools=False):
             folder = Path(mkv).parent
             opt_main = cfg_int("furigana", "main_px", folder)
             align_mode = (common.setting("align", "mode", "jp", folder) or "jp").lower()
+            dump_path = (Path(mkv).with_suffix(".jp.dump.json") if keep_dump else None)
             seg_list, dur, qa = transcribe(wav_path, timeline, max_end,
-                                           (vw, vh), opt_main, align_mode)
+                                           (vw, vh), opt_main, align_mode,
+                                           dump_out=dump_path)
             print(f"  whisper done, duration={dur:.1f}s, 日语 {qa['n']} 条, "
                   f"覆盖 {qa['covered']:.0f}s/{qa['total']:.0f}s, "
                   f"语速>10字/s {qa['cram']} 条")
