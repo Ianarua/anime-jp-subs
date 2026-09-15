@@ -91,6 +91,14 @@ class TestFalseParticle(unittest.TestCase):
 class TestBoundaryRepair(unittest.TestCase):
     """whisper 的段边界修到语言上合法的位置（用户实测的三类毛病）。"""
 
+    def test_all_starters_line_may_end_with_interjection(self):
+        """整行都是起句词（「ああはい」）时，允许它以感動詞结尾；
+        但「…にはどう」+はい 这种"行尾是感動詞、前面还有别的字"的必须罚。"""
+        self.assertTrue(ajs._all_starters("ああはい"))
+        self.assertTrue(ajs._all_starters("はい"))
+        self.assertFalse(ajs._all_starters("よかったな"))
+        self.assertFalse(ajs._all_starters("なのでついていけるか"))
+
     def test_mid_word_shift_moves_to_word_start(self):
         prev = "ありがとうございます北くんは将"          # whisper 把「将来」切成 将｜来
         self.assertEqual(ajs._mid_word_shift(prev, "来どんな社長になりたいとかって"), len(prev) - 1)
@@ -234,11 +242,14 @@ class TestSegmentLines(unittest.TestCase):
                                  main_px=self.MAIN)
 
     def test_interjection_starts_the_next_line(self):
-        """「…かなって」+「いやそんなことないです」：いや 不能留在行尾。"""
+        """「…かなって」+「いやそんなことないです」：いや 不能留在上一行行尾。
+
+        ⚠ 段切分按 whisper 的真实形态来：它把「いやそんなことないです」算一段
+        （不是把 いや 单独切一段）——测试数据要和真实输入一致，否则测的是假情况。
+        """
         segs = [(0.00, 0.50, "かなって", [(0.00, 0.50, "かなって")]),
-                (1.00, 1.50, "いや", [(1.00, 1.50, "いや")]),
-                (2.00, 3.22, "そんなことないです",
-                 [(2.00, 2.60, "そんな"), (2.60, 2.83, "こと"),
+                (1.00, 3.22, "いやそんなことないです",
+                 [(1.00, 1.50, "いや"), (2.00, 2.60, "そんな"), (2.60, 2.83, "こと"),
                   (2.83, 3.04, "ない"), (3.04, 3.22, "です")])]
         spans = [(0.0, 0.5), (1.0, 1.5), (2.0, 3.22)]
         pauses = [(0.5, 1.0, 0.5), (1.5, 2.0, 0.5)]
@@ -270,6 +281,23 @@ class TestSegmentLines(unittest.TestCase):
         pauses = [(0.6, 1.1, 0.5), (1.6, 2.0, 0.4)]
         texts = [t for _s, _e, t in self._lines(segs, spans, pauses)]
         self.assertIn("いかがですか", texts)
+
+    def test_long_pause_between_two_speakers_is_split(self):
+        """用户实测 1:17：长静音两侧是两个人说的话，必须切开成两条。
+
+        whisper 把「ああはい」和「例えば…」算成相邻两段，还把时间吸到了前面那个
+        0.29s 小停顿上；音频实测中间有 **2.18s** 静音。
+        """
+        segs = [(75.43, 76.87, "ああはい", [(75.43, 76.19, "ああ"), (76.19, 77.28, "はい")]),
+                (77.06, 82.79, "例えばこちらの方と",
+                 [(77.06, 77.89, "例えば"), (79.46, 80.03, "こちらの方と")])]
+        # 音频实测（这一段的真实 VAD 结果）：两个人在 2.18s 长静音两侧说话
+        spans = [(76.19, 76.58), (76.86, 77.28), (79.46, 80.03), (80.48, 81.38)]
+        pauses = [(76.58, 76.86, 0.29), (77.28, 79.46, 2.18), (80.03, 80.48, 0.45)]
+        texts = [t for _s, _e, t in self._lines(segs, spans, pauses)]
+        self.assertIn("ああはい", texts)
+        self.assertTrue(any(t.startswith("例えば") for t in texts))
+        self.assertFalse(any("ああはい例えば" in t for t in texts))
 
     def test_long_line_without_pause_is_split_and_never_overflows(self):
         words = [(i * 0.2, i * 0.2 + 0.2, "あ") for i in range(40)]
