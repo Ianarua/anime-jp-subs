@@ -297,16 +297,6 @@ mode      = jp     ; jp = 日语自己断句（默认）；cn = 按中文字幕�
 
 ---
 
-## 设计文档（想改代码 / 想知道为什么这么设计）
-
-README 讲"怎么用"，下面几篇讲"为什么这么设计"：
-
-| 文档 | 内容 |
-|---|---|
-| [docs/architecture.md](docs/architecture.md) | 五步流水线、模块职责、数据流、工具路径解析顺序、为什么要有独立自检 |
-| [docs/segmentation.md](docs/segmentation.md) | **断句算法**：为什么不用中文字幕轨、VAD 停顿 → 词整块落在语音片 → 动态规划拼行、第二遍补漏、怎么验收（含实测数据表） |
-| [docs/models.md](docs/models.md) | 模型选型记录：试过什么、为什么否掉（kotoba / SenseVoice / 单靠音高…），以及"换模型的判断标准" |
-
 ## 项目目录里都有什么
 
 | 文件 / 目录                             | 作用                                                   |
