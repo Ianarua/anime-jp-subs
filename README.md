@@ -252,25 +252,25 @@ mode      = jp     ; jp = 日语自己断句（默认）；cn = 按中文字幕�
 2. `run_jp_sub.bat doctor --download-tools`，让它自己下到项目的 `tools\`。
 3. 也可以自己装好放进 PATH、写进 `config.ini`，或设环境变量（`ANIME_JP_SUB_FFMPEG` 等）。`doctor` 会告诉你缺什么、以及每个程序最终用的是哪一份。
 
-**提示找不到 Whisper 模型。**模型要自己下（约 3GB）：把 `model.bin`、`config.json`、`tokenizer.json`、`preprocessor_config.json`、`vocabulary.json` 放进 `models\large-v3\`。仓库用 `Systran/faster-whisper-large-v3`，别下 `openai/whisper-large-v3`（那个没有 `model.bin`）。连不上 huggingface.co 就用 `hf-mirror.com`。
+**提示找不到 Whisper 模型。** 模型要自己下（约 3GB）：把 `model.bin`、`config.json`、`tokenizer.json`、`preprocessor_config.json`、`vocabulary.json` 放进 `models\large-v3\`。仓库用 `Systran/faster-whisper-large-v3`，别下 `openai/whisper-large-v3`（那个没有 `model.bin`）。连不上 huggingface.co 就用 `hf-mirror.com`。
 
 **注音没压在汉字上，跑到屏幕最底下还被裁掉了。** PotPlayer 开了「屏蔽 ASS 样式」（字幕 → 字幕样式），**关掉它**。
 
-**内封时报「WinError 5 拒绝访问」。**下载器（如 qBittorrent）正在做种、占着文件句柄。暂停那个任务（或退出）再跑。已经生成的 `.jp.mkv` 是好的，也可以手动改名覆盖原文件，不必重跑。
+**内封时报「WinError 5 拒绝访问」。** 下载器（如 qBittorrent）正在做种、占着文件句柄。暂停那个任务（或退出）再跑。已经生成的 `.jp.mkv` 是好的，也可以手动改名覆盖原文件，不必重跑。
 
-**跑得很慢，显卡好像没被用上。**程序会先试 GPU，跑不动就自动改用 CPU（慢很多，一集十几分钟到几十分钟）并在日志里说明。想真正用上显卡，见下面「已知限制」里的 CUDA 运行库那条。
+**跑得很慢，显卡好像没被用上。** 程序会先试 GPU，跑不动就自动改用 CPU（慢很多，一集十几分钟到几十分钟）并在日志里说明。想真正用上显卡，见下面「已知限制」里的 CUDA 运行库那条。
 
-**我明明配了 `config.ini`，为什么不生效？**全局 `config.ini` 要放在**项目根目录**（和 `run_jp_sub.py` 同一层），不是放进 `src` 里面。只想影响一部番的话，放进那个番剧文件夹。拿不准就跑 `doctor` 看「来源」那一行。
+**我明明配了 `config.ini`，为什么不生效？** 全局 `config.ini` 要放在**项目根目录**（和 `run_jp_sub.py` 同一层），不是放进 `src` 里面。只想影响一部番的话，放进那个番剧文件夹。拿不准就跑 `doctor` 看「来源」那一行。
 
-**有几句话没有字幕，或者两句合成了一条长句。**字幕文本来自语音识别，识别错的地方注音也会跟着错。断句是听日语自己的换气停顿来的，碰到「连着说没有明显停顿」的地方偶尔会和原声不完全一致。
+**有几句话没有字幕，或者两句合成了一条长句。** 字幕文本来自语音识别，识别错的地方注音也会跟着错。断句是听日语自己的换气停顿来的，碰到「连着说没有明显停顿」的地方偶尔会和原声不完全一致。
 
-**自动下载卡住 / 下不动。**官方源在部分网络下会慢或连不上。已经下了一半的留在`tools\_download\`，重跑接着下；实在不行就自己装（`winget install Gyan.FFmpeg` +`winget install MoritzBunkus.MKVToolNix`），装完程序会优先用系统里的那份。
+**自动下载卡住 / 下不动。** 官方源在部分网络下会慢或连不上。已经下了一半的留在`tools\_download\`，重跑接着下；实在不行就自己装（`winget install Gyan.FFmpeg` +`winget install MoritzBunkus.MKVToolNix`），装完程序会优先用系统里的那份。
 
-**日志在哪？**被处理目录下的 `anime_jp_sub.log`，每次运行追加。不想写日志就设 `ANIME_JP_SUB_NO_LOG=1`，想换地方就用 `config.ini` 的 `[paths] log_dir` 或环境变量 `ANIME_JP_SUB_LOG_DIR`。
+**日志在哪？** 被处理目录下的 `anime_jp_sub.log`，每次运行追加。不想写日志就设 `ANIME_JP_SUB_NO_LOG=1`，想换地方就用 `config.ini` 的 `[paths] log_dir` 或环境变量 `ANIME_JP_SUB_LOG_DIR`。
 
-**`.tmp_*` 目录是什么？**处理某一集时在片子旁边建的中间目录（放音频和字幕），正常结束会自动删掉；中途 Ctrl-C 掉的残留可以手动删。
+**`.tmp_*` 目录是什么？** 处理某一集时在片子旁边建的中间目录（放音频和字幕），正常结束会自动删掉；中途 Ctrl-C 掉的残留可以手动删。
 
-**怎么彻底卸载？**删掉项目目录就行——`.venv\`、`models\`、`tools\` 。`config.ini`、日志、中间文件都不会污染你的其他目录。
+**怎么彻底卸载？** 删掉项目目录就行——`.venv\`、`models\`、`tools\` 。`config.ini`、日志、中间文件都不会污染你的其他目录。
 
 ---
 
